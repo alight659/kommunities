@@ -2,7 +2,7 @@
 
 An anonymous forum (similar to reddit) written in PHP.
 
-### [Project URL](https://github.com/alight659/kommunities)
+### [Project URL](https://kommunities.onrender.com)
 
 ## Project Info
 Developed for IWP Group Assignment
