@@ -93,6 +93,10 @@ if (!$hasUnique) {
         ALTER TABLE votes_new RENAME TO votes;
         COMMIT;");
 }
+$forumCount = (int)$db->query("SELECT COUNT(*) FROM forums")->fetchColumn();
+if ($forumCount === 0) {
+    $db->exec("INSERT INTO forums (id, name, admin_id) VALUES (1, 'general', NULL)");
+}
 
 
 //  Helpers
@@ -252,6 +256,8 @@ if ($isApi) {
             $name = preg_replace('/[^a-zA-Z0-9_\-]/','',trim($input['display_name'] ?? ''));
             if ($name===''||strlen($name)>30) { http_response_code(400); echo json_encode(['error'=>'display_name must be 1-30 alphanumeric/_/- chars']); break; }
             $db->prepare("UPDATE users SET display_name=:n WHERE token=:t")->execute([':n'=>$name,':t'=>$currentUser['token']]);
+            $db->prepare("UPDATE posts SET author=:n WHERE user_id=:uid")->execute([':n'=>$name,':uid'=>(int)$currentUser['id']]);
+            $db->prepare("UPDATE comments SET author=:n WHERE user_id=:uid")->execute([':n'=>$name,':uid'=>(int)$currentUser['id']]);
             echo json_encode(['ok'=>true,'display_name'=>$name]); break;
         case 'csrf': echo json_encode(['csrf_token'=>csrf_token(),'display_name'=>$displayName]); break;
         case 'forums':
@@ -259,7 +265,11 @@ if ($isApi) {
         case 'create_forum':
             $name = trim($input['name'] ?? '');
             if (!forum_name_valid($name)) { http_response_code(400); echo json_encode(['error'=>'Invalid forum name']); break; }
-            $db->prepare("INSERT OR IGNORE INTO forums (name,admin_id) VALUES (:n,:a)")->execute([':n'=>$name,':a'=>(int)$currentUser['id']]);
+            $exists = $db->prepare("SELECT 1 FROM forums WHERE name=:n");
+            $exists->execute([':n'=>$name]);
+            if (!$exists->fetchColumn()) {
+                $db->prepare("INSERT INTO forums (name,admin_id) VALUES (:n,:a)")->execute([':n'=>$name,':a'=>(int)$currentUser['id']]);
+            }
             echo json_encode(['ok'=>true,'forum'=>$name]); break;
         case 'posts':
             $fn=$_GET['forum']??'general'; $lim=min((int)($_GET['limit']??20),100); $off=max((int)($_GET['offset']??0),0);
@@ -362,7 +372,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         // Rename self
         if (isset($_POST['set_name'])) {
             $n = preg_replace('/[^a-zA-Z0-9_\-]/','',trim($_POST['set_name']));
-            if ($n!==''&&strlen($n)<=30) $db->prepare("UPDATE users SET display_name=:n WHERE token=:t")->execute([':n'=>$n,':t'=>$currentUser['token']]);
+            if ($n!==''&&strlen($n)<=30) {
+                $db->prepare("UPDATE users SET display_name=:n WHERE token=:t")->execute([':n'=>$n,':t'=>$currentUser['token']]);
+                $db->prepare("UPDATE posts SET author=:n WHERE user_id=:uid")->execute([':n'=>$n,':uid'=>(int)$currentUser['id']]);
+                $db->prepare("UPDATE comments SET author=:n WHERE user_id=:uid")->execute([':n'=>$n,':uid'=>(int)$currentUser['id']]);
+            }
             $r = (isset($_GET['page'])&&$_GET['page']==='profile') ? $_SERVER['PHP_SELF'].'?page=profile' : $_SERVER['PHP_SELF'].'?forum='.urlencode($forum);
             header("Location: $r"); exit;
         }
@@ -404,7 +418,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (isset($_POST['new_forum'])) {
             $nf = trim($_POST['new_forum']??'');
             if (forum_name_valid($nf)) {
-                $db->prepare("INSERT OR IGNORE INTO forums (name,admin_id) VALUES (:n,:a)")->execute([':n'=>$nf,':a'=>(int)$currentUser['id']]);
+                $exists = $db->prepare("SELECT 1 FROM forums WHERE name=:n");
+                $exists->execute([':n'=>$nf]);
+                if (!$exists->fetchColumn()) {
+                    $db->prepare("INSERT INTO forums (name,admin_id) VALUES (:n,:a)")->execute([':n'=>$nf,':a'=>(int)$currentUser['id']]);
+                }
                 header("Location: index.php?forum=".urlencode($nf)); exit;
             }
         }
@@ -440,14 +458,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         // Create post
         if (isset($_POST['content']) && !isset($_POST['comment_post_id'])) {
             $ct = trim($_POST['content']??''); $imgData=null; $imgMime=null;
+            $isAjax = !empty($_POST['ajax']) || !empty($_SERVER['HTTP_X_REQUESTED_WITH']);
             if (!empty($_FILES['post_image']['name'])) {
                 try { $img=validate_image($_FILES['post_image']); $imgData=$img['data']; $imgMime=$img['mime']; }
-                catch (RuntimeException $e) { $_SESSION['post_error']=$e->getMessage(); header("Location: index.php?forum=".urlencode($forum)); exit; }
+                catch (RuntimeException $e) {
+                    if ($isAjax) { header('Content-Type: application/json'); echo json_encode(['error'=>$e->getMessage()]); exit; }
+                    $_SESSION['post_error']=$e->getMessage(); header("Location: index.php?forum=".urlencode($forum)); exit;
+                }
             }
+            $newPostId = null;
             if ($ct!==''&&strlen($ct)<=10000) {
-                $db->prepare("INSERT OR IGNORE INTO forums (name,admin_id) VALUES (:n,:a)")->execute([':n'=>$forum,':a'=>(int)$currentUser['id']]);
-                $db->prepare("INSERT INTO posts (forum_id,author,user_id,content,image_data,image_mime) VALUES ((SELECT id FROM forums WHERE name=:f),:a,:uid,:c,:id,:im)")
-                   ->execute([':f'=>$forum,':a'=>$displayName,':uid'=>(int)$currentUser['id'],':c'=>$ct,':id'=>$imgData,':im'=>$imgMime]);
+                $fcheck = $db->prepare("SELECT id FROM forums WHERE name=:n");
+                $fcheck->execute([':n'=>$forum]);
+                if ($fcheck->fetchColumn()) {
+                    $db->prepare("INSERT INTO posts (forum_id,author,user_id,content,image_data,image_mime) VALUES ((SELECT id FROM forums WHERE name=:f),:a,:uid,:c,:id,:im)")
+                       ->execute([':f'=>$forum,':a'=>$displayName,':uid'=>(int)$currentUser['id'],':c'=>$ct,':id'=>$imgData,':im'=>$imgMime]);
+                    $newPostId = (int)$db->lastInsertId();
+                }
+            }
+            if ($isAjax) {
+                header('Content-Type: application/json');
+                if (!$newPostId) { echo json_encode(['error'=>'Post could not be created']); exit; }
+                $pr = $db->prepare("SELECT id,author,user_id,content,votes,created_at,CASE WHEN image_data IS NOT NULL THEN 1 ELSE 0 END AS has_image FROM posts WHERE id=:id");
+                $pr->execute([':id'=>$newPostId]);
+                $newPost = $pr->fetch(PDO::FETCH_ASSOC);
+                echo json_encode(['ok'=>true,'post'=>$newPost,'can_delete'=>true]); exit;
             }
             header("Location: index.php?forum=".urlencode($forum)); exit;
         }
@@ -455,11 +490,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         // Delete post
         if (isset($_POST['delete_post_id'])) {
             $pid=(int)$_POST['delete_post_id'];
+            $isAjax = !empty($_POST['ajax']);
             $r=$db->prepare("SELECT p.user_id,f.name AS forum_name FROM posts p JOIN forums f ON p.forum_id=f.id WHERE p.id=:id"); $r->execute([':id'=>$pid]); $p=$r->fetch(PDO::FETCH_ASSOC);
             if ($p && ((int)$p['user_id']===(int)$currentUser['id'] || is_forum_admin($db,$p['forum_name'],(int)$currentUser['id']))) {
                 $db->prepare("DELETE FROM comments WHERE post_id=:id")->execute([':id'=>$pid]);
                 $db->prepare("DELETE FROM votes WHERE post_id=:id")->execute([':id'=>$pid]);
                 $db->prepare("DELETE FROM posts WHERE id=:id")->execute([':id'=>$pid]);
+                if ($isAjax) { header('Content-Type: application/json'); echo json_encode(['ok'=>true,'post_id'=>$pid]); exit; }
+            } else {
+                if ($isAjax) { header('Content-Type: application/json'); http_response_code(403); echo json_encode(['error'=>'Forbidden']); exit; }
             }
             header("Location: index.php?forum=".urlencode($forum)); exit;
         }
@@ -468,16 +507,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (isset($_POST['comment_post_id'], $_POST['comment_content'])) {
             $ct=trim($_POST['comment_content']??''); $pid=(int)$_POST['comment_post_id'];
             $par=isset($_POST['parent_id'])&&$_POST['parent_id']!==''?(int)$_POST['parent_id']:null;
-            if ($ct!==''&&strlen($ct)<=5000)
+            $isAjax = !empty($_POST['ajax']);
+            $newCid = null;
+            if ($ct!==''&&strlen($ct)<=5000) {
                 $db->prepare("INSERT INTO comments (post_id,parent_id,author,user_id,content) VALUES (:pid,:par,:a,:uid,:c)")
                    ->execute([':pid'=>$pid,':par'=>$par,':a'=>$displayName,':uid'=>(int)$currentUser['id'],':c'=>$ct]);
+                $newCid = (int)$db->lastInsertId();
+            }
+            if ($isAjax) {
+                header('Content-Type: application/json');
+                if (!$newCid) { echo json_encode(['error'=>'Comment could not be saved']); exit; }
+                $cr=$db->prepare("SELECT * FROM comments WHERE id=:id"); $cr->execute([':id'=>$newCid]);
+                echo json_encode(['ok'=>true,'comment'=>$cr->fetch(PDO::FETCH_ASSOC)]); exit;
+            }
             header("Location: index.php?forum=".urlencode($forum)."#post".$pid); exit;
         }
     }
 }
 
-
-// Vote
+// Vote via GET
 $forum = preg_replace('/[^\w\-]/','', $_GET['forum']??'general') ?: 'general';
 if ($currentUser && isset($_GET['vote'], $_GET['post_id'], $_GET['vtok'])) {
     if (hash_equals(csrf_token(), $_GET['vtok'])) {
@@ -486,6 +534,11 @@ if ($currentUser && isset($_GET['vote'], $_GET['post_id'], $_GET['vtok'])) {
         if ($chk->fetch()) $db->prepare("UPDATE votes SET value=:val WHERE post_id=:pid AND voter=:v")->execute([':val'=>$val,':pid'=>$pid,':v'=>$voter]);
         else $db->prepare("INSERT INTO votes (post_id,voter,value) VALUES (:pid,:v,:val)")->execute([':pid'=>$pid,':v'=>$voter,':val'=>$val]);
         $db->prepare("UPDATE posts SET votes=(SELECT COALESCE(SUM(value),0) FROM votes WHERE post_id=:pid) WHERE id=:pid")->execute([':pid'=>$pid]);
+        if (!empty($_GET['ajax'])) {
+            header('Content-Type: application/json');
+            $vr=$db->prepare("SELECT votes FROM posts WHERE id=:pid"); $vr->execute([':pid'=>$pid]);
+            echo json_encode(['ok'=>true,'votes'=>(int)$vr->fetchColumn()]); exit;
+        }
     }
     header("Location: index.php?forum=".urlencode($forum)); exit;
 }
@@ -524,7 +577,11 @@ if ($page === 'profile') {
 // Forum page data
 $forums=[]; $posts=[]; $isCurForumAdmin=false; $forumAdminName=null;
 if ($page === 'forum') {
-    $db->prepare("INSERT OR IGNORE INTO forums (name,admin_id) VALUES (:n,NULL)")->execute([':n'=>$forum]);
+    $forumExists = $db->prepare("SELECT 1 FROM forums WHERE name=:n");
+    $forumExists->execute([':n' => $forum]);
+    if (!$forumExists->fetchColumn()) {
+        header("Location: index.php?forum=general"); exit;
+    }
     $forums = $db->query("SELECT name FROM forums ORDER BY name")->fetchAll(PDO::FETCH_COLUMN);
     $stmt = $db->prepare("SELECT p.*,CASE WHEN p.image_data IS NOT NULL THEN 1 ELSE 0 END AS has_image FROM posts p JOIN forums f ON p.forum_id=f.id WHERE f.name=:f ORDER BY p.created_at DESC");
     $stmt->execute([':f'=>$forum]); $posts = $stmt->fetchAll(PDO::FETCH_ASSOC);
@@ -628,7 +685,7 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
         html.dark .dm-track { background:var(--teal-mid); }
         html.dark .dm-thumb { transform:translateX(12px); }
         .admin-badge { display:inline-block; background:var(--teal-mid); color:#fff; font-size:10px; padding:1px 7px; border-radius:20px; vertical-align:middle; margin-left:5px; letter-spacing:.5px; }
-        .post-image { max-width:100%; max-height:400px; border-radius:8px; margin-top:10px; object-fit:cover; cursor:zoom-in; }
+        .post-image { max-width:100%; max-height:400px; border-radius:8px; margin-top:10px; object-fit:cover; cursor:default; }
         .avatar-img { width:72px; height:72px; border-radius:50%; object-fit:cover; border:2px solid var(--teal-mid); }
         .avatar-sm  { width:28px; height:28px; border-radius:50%; object-fit:cover; border:1px solid rgba(255,255,255,.4); }
         .avatar-placeholder { width:72px; height:72px; border-radius:50%; background:var(--teal-lightest); color:var(--teal-darkest); display:flex; align-items:center; justify-content:center; font-size:28px; font-weight:700; border:2px solid var(--teal-mid); }
@@ -960,8 +1017,9 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
         <!-- Create Post -->
         <div class="card shadow-sm rounded-xl p-5">
             <h2 class="text-lg font-semibold mb-3" style="color:var(--text-secondary)">Create Post</h2>
-            <form method="post" enctype="multipart/form-data" class="space-y-3">
+            <form id="create-post-form" method="post" enctype="multipart/form-data" class="space-y-3">
                 <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrfToken) ?>">
+                <input type="hidden" name="ajax" value="1">
                 <textarea name="content" required maxlength="10000"
                     class="w-full border rounded-lg p-3 text-sm resize-none h-24"
                     style="border-color:var(--border-color)"
@@ -975,28 +1033,32 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
                         <input type="file" name="post_image" accept="image/jpeg,image/png,image/gif,image/webp" class="sr-only"
                             onchange="document.getElementById('attach-label').textContent=this.files[0]?this.files[0].name:'Attach image'">
                     </label>
-                    <button type="submit" class="btn-primary px-5 py-2 rounded-lg text-sm font-medium">Post</button>
+                    <button type="submit" id="post-submit-btn" class="btn-primary px-5 py-2 rounded-lg text-sm font-medium">Post</button>
+                    <span id="post-error-msg" class="text-sm hidden" style="color:#dc2626"></span>
                 </div>
             </form>
         </div>
 
         <!-- Posts -->
+        <div id="posts-list" class="space-y-5">
         <?php if ($posts): ?>
         <?php foreach ($posts as $post):
             $canDelete = (int)$post['user_id'] === (int)$currentUser['id'] || $isCurForumAdmin;
         ?>
         <div id="post<?= (int)$post['id'] ?>" class="card shadow-sm rounded-xl flex flex-col md:flex-row overflow-hidden">
             <!-- Vote strip -->
-            <div class="flex md:flex-col flex-row items-center justify-center p-3 gap-2 md:gap-1 min-w-[3.5rem]"
+            <div id="vs<?= (int)$post['id'] ?>" class="flex md:flex-col flex-row items-center justify-center p-3 gap-2 md:gap-1 min-w-[3.5rem]"
                  style="background-color:var(--vote-strip-bg)">
-                <a href="?forum=<?= urlencode($forum) ?>&vote=up&post_id=<?= (int)$post['id'] ?>&vtok=<?= urlencode($csrfToken) ?>"
+                <a href="?forum=<?= urlencode($forum) ?>&vote=up&post_id=<?= (int)$post['id'] ?>&vtok=<?= urlencode($csrfToken) ?>&ajax=1"
+                   data-vote="up" data-pid="<?= (int)$post['id'] ?>"
                    class="flex items-center justify-center w-9 h-9 rounded-lg vote-btn vote-btn-up">
                     <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 15l7-7 7 7"/>
                     </svg>
                 </a>
-                <span class="font-bold text-sm text-center min-w-[1.5rem]" style="color:var(--teal-mid)"><?= (int)$post['votes'] ?></span>
-                <a href="?forum=<?= urlencode($forum) ?>&vote=down&post_id=<?= (int)$post['id'] ?>&vtok=<?= urlencode($csrfToken) ?>"
+                <span class="vote-count font-bold text-sm text-center min-w-[1.5rem]" style="color:var(--teal-mid)"><?= (int)$post['votes'] ?></span>
+                <a href="?forum=<?= urlencode($forum) ?>&vote=down&post_id=<?= (int)$post['id'] ?>&vtok=<?= urlencode($csrfToken) ?>&ajax=1"
+                   data-vote="down" data-pid="<?= (int)$post['id'] ?>"
                    class="flex items-center justify-center w-9 h-9 rounded-lg vote-btn vote-btn-down">
                     <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M19 9l-7 7-7-7"/>
@@ -1020,14 +1082,15 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
                     · <?= htmlspecialchars($post['created_at']) ?>
                 </p>
                 <!-- Comments -->
-                <div class="space-y-3 border-t pt-4" style="border-color:var(--border-subtle)">
+                <div id="comments-<?= (int)$post['id'] ?>" class="space-y-3 border-t pt-4" style="border-color:var(--border-subtle)">
                     <?php foreach (get_comments($db, (int)$post['id']) as $comment): ?>
-                    <div class="rounded-lg p-3 space-y-2" style="background:var(--bg-subtle)">
+                    <div id="comment-<?= (int)$comment['id'] ?>" class="rounded-lg p-3 space-y-2" style="background:var(--bg-subtle)">
                         <p class="text-sm whitespace-pre-wrap" style="color:var(--text-primary)"><?= htmlspecialchars($comment['content']) ?></p>
                         <p class="text-xs" style="color:var(--text-muted)">
                             <?php if ($comment['user_id']): ?><a href="index.php?page=profile&uid=<?= (int)$comment['user_id'] ?>" class="font-medium hover:underline" style="color:var(--text-author)"><?= htmlspecialchars($comment['author']) ?></a><?php else: ?><span class="font-medium" style="color:var(--text-author)"><?= htmlspecialchars($comment['author']) ?></span><?php endif; ?>
                             · <?= htmlspecialchars($comment['created_at']) ?>
                         </p>
+                        <div id="replies-<?= (int)$comment['id'] ?>" class="space-y-2">
                         <?php foreach (get_comments($db, (int)$post['id'], (int)$comment['id']) as $reply): ?>
                         <div class="rounded-lg p-2.5 ml-4" style="background:var(--reply-bg);border:1px solid var(--reply-border)">
                             <p class="text-sm whitespace-pre-wrap" style="color:var(--text-primary)"><?= htmlspecialchars($reply['content']) ?></p>
@@ -1037,7 +1100,7 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
                             </p>
                         </div>
                         <?php endforeach; ?>
-                        <form method="post" class="flex gap-2 pt-1">
+                        <form data-comment-form method="post" class="flex gap-2 pt-1">
                             <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrfToken) ?>">
                             <input type="hidden" name="comment_post_id" value="<?= (int)$post['id'] ?>">
                             <input type="hidden" name="parent_id" value="<?= (int)$comment['id'] ?>">
@@ -1045,9 +1108,10 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
                                 class="flex-1 border rounded-lg p-2 text-sm" style="border-color:var(--border-color)">
                             <button type="submit" class="btn-secondary px-3 py-1 rounded-lg text-sm font-medium">Reply</button>
                         </form>
+                        </div>
                     </div>
                     <?php endforeach; ?>
-                    <form method="post" class="flex gap-2">
+                    <form data-comment-form data-main-comment method="post" class="flex gap-2">
                         <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrfToken) ?>">
                         <input type="hidden" name="comment_post_id" value="<?= (int)$post['id'] ?>">
                         <input type="text" name="comment_content" maxlength="5000" required placeholder="Add a comment…"
@@ -1064,7 +1128,7 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
                 <h2 class="text-xl font-bold" style="color:#dc2626">Delete this post?</h2>
                 <p class="text-sm" style="color:var(--text-secondary)">All comments will also be deleted. This cannot be undone.</p>
                 <div class="flex gap-3">
-                    <form method="post" class="flex-1">
+                    <form method="post" data-delete-post class="flex-1">
                         <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrfToken) ?>">
                         <input type="hidden" name="delete_post_id" value="<?= (int)$post['id'] ?>">
                         <button type="submit" class="w-full btn-danger py-2 rounded-lg font-semibold text-sm">Yes, delete</button>
@@ -1077,8 +1141,9 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
         <?php endif; ?>
         <?php endforeach; ?>
         <?php else: ?>
-        <div class="card shadow-sm rounded-xl p-8 text-center italic" style="color:var(--text-muted)">No posts yet. Be the first!</div>
+        <div id="no-posts-msg" class="card shadow-sm rounded-xl p-8 text-center italic" style="color:var(--text-muted)">No posts yet. Be the first!</div>
         <?php endif; ?>
+        </div><!-- /#posts-list -->
     </div>
 
     <!-- Sidebar -->
@@ -1147,6 +1212,256 @@ if (tv) tv.addEventListener('click', revealToken);
 document.querySelectorAll('[id$="-modal"],[id^="dpm"]').forEach(function(m) {
     m.addEventListener('click', function(e) { if (e.target === m) m.classList.add('hidden'); });
 });
+
+// AJAX interactions
+(function() {
+    var forum    = <?= json_encode($forum ?? 'general') ?>;
+    var userId   = <?= json_encode($currentUser ? (int)$currentUser['id'] : 0) ?>;
+    var userName = <?= json_encode($currentUser ? $currentUser['display_name'] : '') ?>;
+    var csrfTok  = <?= json_encode($csrfToken) ?>;
+    var isAdmin  = <?= json_encode($isCurForumAdmin ?? false) ?>;
+    var baseUrl  = window.location.pathname + '?forum=' + encodeURIComponent(forum);
+
+    function escHtml(s) {
+        return String(s)
+            .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+            .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    function authorHtml(uid, name) {
+        if (!uid) return '<span class="font-medium" style="color:var(--text-author)">' + escHtml(name) + '</span>';
+        return '<a href="index.php?page=profile&uid=' + escHtml(uid) + '" class="font-medium hover:underline" style="color:var(--text-author)">' + escHtml(name) + '</a>';
+    }
+
+    // AJAX Voting
+    document.addEventListener('click', function(e) {
+        var voteLink = e.target.closest('a[data-vote]');
+        if (!voteLink) return;
+        e.preventDefault();
+        var pid  = voteLink.dataset.pid;
+        var dir  = voteLink.dataset.vote;
+        var url  = baseUrl + '&vote=' + dir + '&post_id=' + pid + '&vtok=' + encodeURIComponent(csrfTok) + '&ajax=1';
+        var strip = document.getElementById('vs' + pid);
+        if (voteLink.dataset.pending) return;
+        voteLink.dataset.pending = '1';
+        fetch(url).then(function(r){ return r.json(); }).then(function(d) {
+            if (d.ok && strip) {
+                strip.querySelector('.vote-count').textContent = d.votes;
+                // Flash colour
+                strip.querySelector('.vote-count').style.transition = 'color .1s';
+                strip.querySelector('.vote-count').style.color = dir === 'up' ? 'var(--teal-mid)' : '#cc4444';
+                setTimeout(function(){ strip.querySelector('.vote-count').style.color = ''; }, 600);
+            }
+        }).finally(function(){ delete voteLink.dataset.pending; });
+    });
+
+    // AJAX Comments & replies
+    document.addEventListener('submit', function(e) {
+        var form = e.target;
+        if (!form.matches('form[data-comment-form]')) return;
+        e.preventDefault();
+
+        var pid     = form.querySelector('[name="comment_post_id"]').value;
+        var parEl   = form.querySelector('[name="parent_id"]');
+        var parId   = parEl ? parEl.value : '';
+        var input   = form.querySelector('[name="comment_content"]');
+        var content = input.value.trim();
+        if (!content) return;
+
+        var btn = form.querySelector('button[type="submit"]');
+        btn.disabled = true;
+
+        var fd = new FormData();
+        fd.append('csrf_token', csrfTok);
+        fd.append('comment_post_id', pid);
+        fd.append('comment_content', content);
+        fd.append('ajax', '1');
+        if (parId !== '') fd.append('parent_id', parId);
+
+        fetch(window.location.href, { method: 'POST', body: fd })
+        .then(function(r){ return r.json(); })
+        .then(function(d) {
+            if (!d.ok) return;
+            var c = d.comment;
+            input.value = '';
+
+            var commentHtml =
+                '<p class="text-sm whitespace-pre-wrap" style="color:var(--text-primary)">' + escHtml(c.content) + '</p>' +
+                '<p class="text-xs mt-1" style="color:var(--text-muted)">' + authorHtml(c.user_id, c.author) + ' &middot; just now</p>';
+
+            if (parId !== '') {
+                var replyZone = document.getElementById('replies-' + parId);
+                if (replyZone) {
+                    var div = document.createElement('div');
+                    div.className = 'rounded-lg p-2.5 ml-4';
+                    div.style.cssText = 'background:var(--reply-bg);border:1px solid var(--reply-border);animation:fadeIn .2s ease';
+                    div.innerHTML = commentHtml;
+                    replyZone.insertBefore(div, replyZone.lastElementChild);
+                }
+            } else {
+                var commentList = document.getElementById('comments-' + pid);
+                if (commentList) {
+                    var wrap = document.createElement('div');
+                    wrap.className = 'rounded-lg p-3 space-y-2';
+                    wrap.style.cssText = 'background:var(--bg-subtle);animation:fadeIn .2s ease';
+                    wrap.id = 'comment-' + c.id;
+                    var replyZoneDiv = '<div id="replies-' + c.id + '" class="space-y-2">';
+                    replyZoneDiv += '<form data-comment-form class="flex gap-2 pt-1">' +
+                        '<input type="hidden" name="comment_post_id" value="' + escHtml(pid) + '">' +
+                        '<input type="hidden" name="parent_id" value="' + escHtml(c.id) + '">' +
+                        '<input type="text" name="comment_content" maxlength="5000" required placeholder="Reply\u2026" class="flex-1 border rounded-lg p-2 text-sm" style="border-color:var(--border-color)">' +
+                        '<button type="submit" class="btn-secondary px-3 py-1 rounded-lg text-sm font-medium">Reply</button>' +
+                        '</form></div>';
+
+                    wrap.innerHTML = commentHtml + replyZoneDiv;
+                    var mainForm = commentList.querySelector('form[data-main-comment]');
+                    commentList.insertBefore(wrap, mainForm);
+                }
+            }
+        })
+        .finally(function(){ btn.disabled = false; });
+    });
+
+    // AJAX Delete post
+    document.addEventListener('submit', function(e) {
+        var form = e.target;
+        if (!form.matches('form[data-delete-post]')) return;
+        e.preventDefault();
+
+        var pid = form.querySelector('[name="delete_post_id"]').value;
+        var btn = form.querySelector('button[type="submit"]');
+        btn.disabled = true;
+        btn.textContent = 'Deleting...';
+
+        var fd = new FormData();
+        fd.append('csrf_token', csrfTok);
+        fd.append('delete_post_id', pid);
+        fd.append('ajax', '1');
+
+        fetch(window.location.href, { method: 'POST', body: fd })
+        .then(function(r){ return r.json(); })
+        .then(function(d) {
+            if (!d.ok) { btn.disabled = false; btn.textContent = 'Yes, delete'; return; }
+            var card  = document.getElementById('post' + pid);
+            var modal = document.getElementById('dpm' + pid);
+            if (modal) modal.remove();
+            if (card) {
+                card.style.transition = 'opacity .2s,transform .2s';
+                card.style.opacity = '0';
+                card.style.transform = 'scale(.97)';
+                setTimeout(function(){ card.remove(); }, 220);
+            }
+        })
+        .catch(function(){ btn.disabled = false; btn.textContent = 'Yes, delete'; });
+    });
+
+    // AJAX Create post
+    var createForm = document.getElementById('create-post-form');
+    if (createForm) {
+        var submitBtn = document.getElementById('post-submit-btn');
+        var errMsg    = document.getElementById('post-error-msg');
+        var postsList = document.getElementById('posts-list');
+
+        function buildPostCard(post) {
+            var pid  = parseInt(post.id, 10);
+            var up   = baseUrl + '&vote=up&post_id=' + pid + '&vtok=' + encodeURIComponent(csrfTok) + '&ajax=1';
+            var down = baseUrl + '&vote=down&post_id=' + pid + '&vtok=' + encodeURIComponent(csrfTok) + '&ajax=1';
+
+            var deleteBtn =
+                '<button onclick="document.getElementById(\'dpm' + pid + '\').classList.remove(\'hidden\')" ' +
+                'class="flex-shrink-0 btn-danger text-xs px-2 py-1 rounded opacity-70 hover:opacity-100 ml-2">Delete</button>';
+
+            var imgHtml = post.has_image == 1
+                ? '<img src="index.php?img=post&id=' + pid + '" alt="" class="post-image">'
+                : '';
+
+            var deleteModal =
+                '<div id="dpm' + pid + '" class="fixed inset-0 modal-bg z-50 items-center justify-center p-4 hidden flex">' +
+                '<div class="modal-card rounded-2xl shadow-2xl w-full max-w-sm p-7 space-y-5">' +
+                '<h2 class="text-xl font-bold" style="color:#dc2626">Delete this post?</h2>' +
+                '<p class="text-sm" style="color:var(--text-secondary)">All comments will also be deleted. This cannot be undone.</p>' +
+                '<div class="flex gap-3">' +
+                '<form method="post" data-delete-post class="flex-1">' +
+                '<input type="hidden" name="csrf_token" value="' + escHtml(csrfTok) + '">' +
+                '<input type="hidden" name="delete_post_id" value="' + pid + '">' +
+                '<button type="submit" class="w-full btn-danger py-2 rounded-lg font-semibold text-sm">Yes, delete</button>' +
+                '</form>' +
+                '<button onclick="document.getElementById(\'dpm' + pid + '\').classList.add(\'hidden\')" ' +
+                'class="flex-1 btn-secondary py-2 rounded-lg font-semibold text-sm">Cancel</button>' +
+                '</div></div></div>';
+
+            return (
+                '<div id="post' + pid + '" class="card shadow-sm rounded-xl flex flex-col md:flex-row overflow-hidden" style="animation:fadeIn .25s ease">' +
+                '<div id="vs' + pid + '" class="flex md:flex-col flex-row items-center justify-center p-3 gap-2 md:gap-1 min-w-[3.5rem]" style="background-color:var(--vote-strip-bg)">' +
+                '<a data-vote="up" data-pid="' + pid + '" href="#" class="flex items-center justify-center w-9 h-9 rounded-lg vote-btn vote-btn-up">' +
+                '<svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 15l7-7 7 7"/></svg></a>' +
+                '<span class="vote-count font-bold text-sm text-center min-w-[1.5rem]" style="color:var(--teal-mid)">0</span>' +
+                '<a data-vote="down" data-pid="' + pid + '" href="#" class="flex items-center justify-center w-9 h-9 rounded-lg vote-btn vote-btn-down">' +
+                '<svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M19 9l-7 7-7-7"/></svg></a>' +
+                '</div>' +
+                '<div class="flex-1 p-5">' +
+                '<div class="flex items-start justify-between gap-2">' +
+                '<p class="flex-1 whitespace-pre-wrap" style="color:var(--text-primary)">' + escHtml(post.content) + '</p>' +
+                deleteBtn +
+                '</div>' +
+                imgHtml +
+                '<p class="text-xs mt-2 mb-4" style="color:var(--text-muted)">by ' + authorHtml(userId, post.author) + ' &middot; just now</p>' +
+                '<div id="comments-' + pid + '" class="space-y-3 border-t pt-4" style="border-color:var(--border-subtle)">' +
+                '<form data-comment-form data-main-comment class="flex gap-2">' +
+                '<input type="hidden" name="comment_post_id" value="' + pid + '">' +
+                '<input type="text" name="comment_content" maxlength="5000" required placeholder="Add a comment\u2026" class="flex-1 border rounded-lg p-2 text-sm" style="border-color:var(--border-color)">' +
+                '<button type="submit" class="btn-primary px-3 py-1 rounded-lg text-sm font-medium">Comment</button>' +
+                '</form></div>' +
+                '</div></div>' +
+                deleteModal
+            );
+        }
+
+        createForm.addEventListener('submit', function(e) {
+            e.preventDefault();
+            var content = createForm.querySelector('textarea[name="content"]').value.trim();
+            if (!content) return;
+
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Posting...';
+            errMsg.classList.add('hidden');
+
+            fetch(window.location.href, { method: 'POST', body: new FormData(createForm) })
+            .then(function(r){ return r.json(); })
+            .then(function(data) {
+                if (data.error) {
+                    errMsg.textContent = data.error;
+                    errMsg.classList.remove('hidden');
+                    return;
+                }
+                createForm.querySelector('textarea[name="content"]').value = '';
+                var fi = createForm.querySelector('input[type="file"]');
+                if (fi) fi.value = '';
+                document.getElementById('attach-label').textContent = 'Attach image';
+
+                var nope = document.getElementById('no-posts-msg');
+                if (nope) nope.remove();
+
+                var tmp = document.createElement('div');
+                tmp.innerHTML = buildPostCard(data.post);
+                while (tmp.firstChild) postsList.insertBefore(tmp.firstChild, postsList.firstChild);
+            })
+            .catch(function() {
+                errMsg.textContent = 'Network error. Please try again.';
+                errMsg.classList.remove('hidden');
+            })
+            .finally(function() {
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Post';
+            });
+        });
+    }
+})();
 </script>
+
+<style>@keyframes fadeIn{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}</style>
+<footer class="text-center text-xs py-6 mt-4" style="color:var(--text-muted)">
+    <span style="display: inline-block; transform: rotateY(180deg);">&copy;</span> CopyLeft <?= date('Y') ?> Kommunities
+</footer>
 </body>
 </html>
