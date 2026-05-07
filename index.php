@@ -139,6 +139,10 @@ function is_forum_admin(PDO $db, string $forum_name, int $user_id): bool {
     return $r && (int)$r['admin_id'] === $user_id;
 }
 
+// CSRF Rotate
+function rotate_csrf(): void {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
 
 // Image Validator and EXIF Stripper
 function validate_image(array $file): array {
@@ -344,7 +348,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (isset($_POST['action'])) {
         if ($_POST['action'] === 'generate_token') {
             $user = create_user($db);
-            $_SESSION['user_token'] = $user['token']; $_SESSION['new_token_show'] = $user['token'];
+            $_SESSION['user_token'] = $user['token']; rotate_csrf(); $_SESSION['new_token_show'] = $user['token'];
             setcookie('user_token', $user['token'], time()+60*60*24*365, '/', '', false, true);
             header("Location: ".$_SERVER['PHP_SELF']."?forum=".urlencode($_GET['forum']??'general')); exit;
         }
@@ -352,7 +356,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $t = strtoupper(preg_replace('/[^A-F0-9\-]/','',trim($_POST['token']??'')));
             $user = user_by_token($db, $t);
             if ($user) {
+                session_regenerate_id(true);
                 $_SESSION['user_token'] = $user['token'];
+                rotate_csrf();
                 setcookie('user_token', $user['token'], time()+60*60*24*365, '/', '', false, true);
                 touch_user($db, $user['token']);
                 header("Location: ".$_SERVER['PHP_SELF']."?forum=".urlencode($_GET['forum']??'general')); exit;
@@ -360,6 +366,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
         if ($_POST['action'] === 'logout') {
             unset($_SESSION['user_token']);
+            rotate_csrf();
             setcookie('user_token', '', time()-1, '/', '', false, true);
             header("Location: ".$_SERVER['PHP_SELF']."?forum=".urlencode($_GET['forum']??'general')); exit;
         }
@@ -410,7 +417,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $db->prepare("DELETE FROM posts WHERE user_id=:uid")->execute([':uid'=>$uid]);
             $db->prepare("DELETE FROM comments WHERE user_id=:uid")->execute([':uid'=>$uid]);
             $db->prepare("DELETE FROM users WHERE id=:uid")->execute([':uid'=>$uid]);
-            unset($_SESSION['user_token']); setcookie('user_token','',time()-1,'/',  '','', false,true);
+            unset($_SESSION['user_token']); setcookie('user_token', '', time()-1, '/', '', false, true);
             header("Location: ".$_SERVER['PHP_SELF']); exit;
         }
 
@@ -612,7 +619,7 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
             echo ' - k/'.htmlspecialchars($forum);
         }
     ?></title>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     <style>
         :root {
             --teal-lightest:#b2d8d8; --teal-light:#66b2b2;
@@ -690,6 +697,8 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
         .avatar-sm  { width:28px; height:28px; border-radius:50%; object-fit:cover; border:1px solid rgba(255,255,255,.4); }
         .avatar-placeholder { width:72px; height:72px; border-radius:50%; background:var(--teal-lightest); color:var(--teal-darkest); display:flex; align-items:center; justify-content:center; font-size:28px; font-weight:700; border:2px solid var(--teal-mid); }
         .avatar-sm-placeholder { width:28px; height:28px; border-radius:50%; background:rgba(255,255,255,.2); display:inline-flex; align-items:center; justify-content:center; font-size:13px; font-weight:700; }
+        #forum-search { transition: border-color .15s, box-shadow .15s; }
+        #forum-show-more { cursor: pointer; }
     </style>
 </head>
 <body class="min-h-screen">
@@ -1149,15 +1158,32 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
     <!-- Sidebar -->
     <div class="col-span-1 md:col-span-3 space-y-4">
         <div class="card shadow-sm rounded-xl p-4 sticky top-20">
-            <h2 class="text-xs font-semibold uppercase tracking-widest mb-3" style="color:var(--teal-mid)">Forums</h2>
-            <div class="flex flex-col gap-0.5">
-                <?php foreach ($forums as $f): ?>
+            <h2 class="text-xs font-semibold uppercase tracking-widest mb-2" style="color:var(--teal-mid)">Forums</h2>
+            <!-- Search bar -->
+            <div class="relative mb-2">
+                <input type="text" id="forum-search" placeholder="Search forums…" autocomplete="off"
+                    class="w-full border rounded-lg pl-8 pr-3 py-1.5 text-xs"
+                    style="border-color:var(--border-color);background:var(--input-bg);color:var(--input-text)">
+                <svg class="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 pointer-events-none" style="color:var(--text-muted)" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-4.35-4.35M17 11A6 6 0 1 1 5 11a6 6 0 0 1 12 0z"/>
+                </svg>
+            </div>
+            <div id="forum-list" class="flex flex-col gap-0.5">
+                <?php foreach ($forums as $fi => $f): ?>
                 <a href="index.php?forum=<?= urlencode($f) ?>"
-                   class="px-3 py-2 rounded-lg text-sm transition-colors <?= $f===$forum?'forum-active':'forum-link' ?>">
+                   class="forum-item px-3 py-2 rounded-lg text-sm transition-colors <?= $f===$forum?'forum-active':'forum-link' ?>"
+                   data-name="<?= htmlspecialchars(strtolower($f)) ?>"
+                   <?= $fi >= 5 && $f !== $forum ? 'style="display:none" data-overflow="1"' : '' ?>>
                     k/<?= htmlspecialchars($f) ?>
                 </a>
                 <?php endforeach; ?>
             </div>
+            <?php if (count($forums) > 5): ?>
+            <button id="forum-show-more" class="mt-1.5 w-full text-xs py-1 rounded-lg transition-colors tab-inactive hover:opacity-80"
+                onclick="toggleMoreForums(this)">
+                + <?= count($forums) - 5 ?> more
+            </button>
+            <?php endif; ?>
         </div>
         <div class="card shadow-sm rounded-xl p-4">
             <h2 class="text-xs font-semibold uppercase tracking-widest mb-3" style="color:var(--teal-mid)">New Forum</h2>
@@ -1213,8 +1239,49 @@ document.querySelectorAll('[id$="-modal"],[id^="dpm"]').forEach(function(m) {
     m.addEventListener('click', function(e) { if (e.target === m) m.classList.add('hidden'); });
 });
 
-// AJAX interactions
+// Forum search & show-more
+function toggleMoreForums(btn) {
+    var items = document.querySelectorAll('#forum-list .forum-item[data-overflow="1"]');
+    var expanded = btn.dataset.expanded === '1';
+    if (expanded) {
+        items.forEach(function(a) { a.style.display = 'none'; });
+        btn.dataset.expanded = '0';
+        btn.textContent = '+ ' + items.length + ' more';
+    } else {
+        items.forEach(function(a) { a.style.display = ''; });
+        btn.dataset.expanded = '1';
+        btn.textContent = 'Show less';
+    }
+}
+
 (function() {
+    var forumSearch = document.getElementById('forum-search');
+    if (forumSearch) {
+        forumSearch.addEventListener('input', function() {
+            var q = this.value.trim().toLowerCase();
+            var showMoreBtn = document.getElementById('forum-show-more');
+            var items = document.querySelectorAll('#forum-list .forum-item');
+            var overflowCount = 0;
+            items.forEach(function(a) {
+                if (q === '') {
+                    if (a.dataset.overflow === '1') {
+                        var expanded = showMoreBtn && showMoreBtn.dataset.expanded === '1';
+                        a.style.display = expanded ? '' : 'none';
+                        overflowCount++;
+                    } else {
+                        a.style.display = '';
+                    }
+                } else {
+                    var match = a.dataset.name.indexOf(q) !== -1;
+                    a.style.display = match ? '' : 'none';
+                }
+            });
+            if (showMoreBtn) {
+                showMoreBtn.style.display = (q === '') ? '' : 'none';
+            }
+        });
+    }
+
     var forum    = <?= json_encode($forum ?? 'general') ?>;
     var userId   = <?= json_encode($currentUser ? (int)$currentUser['id'] : 0) ?>;
     var userName = <?= json_encode($currentUser ? $currentUser['display_name'] : '') ?>;
@@ -1247,7 +1314,6 @@ document.querySelectorAll('[id$="-modal"],[id^="dpm"]').forEach(function(m) {
         fetch(url).then(function(r){ return r.json(); }).then(function(d) {
             if (d.ok && strip) {
                 strip.querySelector('.vote-count').textContent = d.votes;
-                // Flash colour
                 strip.querySelector('.vote-count').style.transition = 'color .1s';
                 strip.querySelector('.vote-count').style.color = dir === 'up' ? 'var(--teal-mid)' : '#cc4444';
                 setTimeout(function(){ strip.querySelector('.vote-count').style.color = ''; }, 600);
