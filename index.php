@@ -193,7 +193,16 @@ function csrf_verify(): void {
 //  Identity Resolution
 $currentUser = null; $authError = null;
 $bearerToken = null;
-$authHeader  = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
+
+$authHeader = $_SERVER['HTTP_AUTHORIZATION']
+           ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION']
+           ?? '';
+if (!$authHeader && function_exists('apache_request_headers')) {
+    $reqHeaders = apache_request_headers();
+    foreach ($reqHeaders as $k => $v) {
+        if (strtolower($k) === 'authorization') { $authHeader = $v; break; }
+    }
+}
 if (preg_match('/^Bearer\s+(.+)$/i', $authHeader, $m)) $bearerToken = trim($m[1]);
 if (!$bearerToken && isset($_GET['token'])) $bearerToken = trim($_GET['token']);
 if ($bearerToken) { $currentUser = user_by_token($db, $bearerToken); if ($currentUser) touch_user($db, $currentUser['token']); }
@@ -227,115 +236,385 @@ if (isset($_GET['img'])) {
 
 
 //  API Layer
-$isApi = isset($_GET['api']) || (isset($_SERVER['HTTP_ACCEPT']) && str_contains($_SERVER['HTTP_ACCEPT'], 'application/json'));
+function api_input(): array {
+    $ct = $_SERVER['CONTENT_TYPE'] ?? '';
+    if (str_contains($ct, 'multipart/form-data')) {
+        return $_POST;
+    }
+    $raw = file_get_contents('php://input');
+    if ($raw !== false && $raw !== '') {
+        $decoded = json_decode($raw, true);
+        if (is_array($decoded)) return $decoded;
+        parse_str($raw, $parsed);
+        if ($parsed) return $parsed;
+    }
+    return $_POST;
+}
+
+function api_field(array $input, string $key, mixed $default = ''): mixed {
+    return $input[$key] ?? $_POST[$key] ?? $default;
+}
+
+$isApi = isset($_GET['api']) || isset($_GET['action'])
+      || (isset($_SERVER['HTTP_ACCEPT']) && str_contains($_SERVER['HTTP_ACCEPT'], 'application/json'));
+
 if ($isApi) {
-    header('Content-Type: application/json'); header('X-Content-Type-Options: nosniff');
+    header('Content-Type: application/json');
+    header('X-Content-Type-Options: nosniff');
+
     $method = $_SERVER['REQUEST_METHOD'];
-    $action = $_GET['action'] ?? '';
-    $input  = json_decode(file_get_contents('php://input'), true) ?? [];
+    $action = trim($_GET['action'] ?? '');
+    $input  = api_input();
 
     if ($action === 'generate_token') {
         $user = create_user($db);
-        echo json_encode(['ok'=>true,'token'=>$user['token'],'display_name'=>$user['display_name'],'note'=>'Save your token — it cannot be recovered.']); exit;
+        echo json_encode([
+            'ok'           => true,
+            'token'        => $user['token'],
+            'display_name' => $user['display_name'],
+            'note'         => 'Save your token - it cannot be recovered.',
+        ]);
+        exit;
     }
+
     if ($action === 'login') {
-        $t = trim($input['token'] ?? $_GET['token'] ?? '');
-        if (!$t) { http_response_code(400); echo json_encode(['error'=>'token required']); exit; }
+        $t = strtoupper(trim(api_field($input, 'token', $_GET['token'] ?? '')));
+        if (!$t) { http_response_code(400); echo json_encode(['error' => 'token required']); exit; }
         $user = user_by_token($db, $t);
-        if (!$user) { http_response_code(401); echo json_encode(['error'=>'Invalid token']); exit; }
+        if (!$user) { http_response_code(401); echo json_encode(['error' => 'Invalid token']); exit; }
         touch_user($db, $user['token']);
-        echo json_encode(['ok'=>true,'display_name'=>$user['display_name'],'token'=>$user['token']]); exit;
+        echo json_encode(['ok' => true, 'display_name' => $user['display_name'], 'token' => $user['token']]);
+        exit;
     }
-    $publicReadActions = ['forums','posts','comments','user_profile'];
-    if (!in_array($action, $publicReadActions, true) && !$currentUser) {
+
+    $publicActions = ['forums', 'posts', 'comments', 'user_profile'];
+
+    if (!in_array($action, $publicActions, true) && !$currentUser) {
         http_response_code(401);
-        echo json_encode(['error'=>'Unauthenticated. Send: Authorization: Bearer YOUR-TOKEN',
-                          'help'=>['generate'=>'POST ?api=1&action=generate_token','login'=>'POST ?api=1&action=login body:{token}']]); exit;
+        echo json_encode([
+            'error' => 'Unauthenticated. Send: Authorization: Bearer YOUR-TOKEN',
+            'help'  => [
+                'generate' => 'POST ?action=generate_token',
+                'login'    => 'POST ?action=login  body: {token}',
+            ],
+        ]);
+        exit;
     }
     switch ($action) {
         case 'me':
-            echo json_encode(['display_name'=>$currentUser['display_name'],'token'=>$currentUser['token'],
-                              'bio'=>$currentUser['bio'],'created_at'=>$currentUser['created_at'],'last_seen'=>$currentUser['last_seen']]); break;
+            echo json_encode([
+                'id'           => (int)$currentUser['id'],
+                'display_name' => $currentUser['display_name'],
+                'token'        => $currentUser['token'],
+                'bio'          => $currentUser['bio'],
+                'has_avatar'   => !empty($currentUser['avatar_data']),
+                'created_at'   => $currentUser['created_at'],
+                'last_seen'    => $currentUser['last_seen'],
+            ]);
+            break;
+
         case 'rename':
-            $name = preg_replace('/[^a-zA-Z0-9_\-]/','',trim($input['display_name'] ?? ''));
-            if ($name===''||strlen($name)>30) { http_response_code(400); echo json_encode(['error'=>'display_name must be 1-30 alphanumeric/_/- chars']); break; }
-            $db->prepare("UPDATE users SET display_name=:n WHERE token=:t")->execute([':n'=>$name,':t'=>$currentUser['token']]);
-            $db->prepare("UPDATE posts SET author=:n WHERE user_id=:uid")->execute([':n'=>$name,':uid'=>(int)$currentUser['id']]);
-            $db->prepare("UPDATE comments SET author=:n WHERE user_id=:uid")->execute([':n'=>$name,':uid'=>(int)$currentUser['id']]);
-            echo json_encode(['ok'=>true,'display_name'=>$name]); break;
-        case 'csrf': echo json_encode(['csrf_token'=>csrf_token(),'display_name'=>$displayName]); break;
-        case 'forums':
-            echo json_encode(['forums'=>$db->query("SELECT name FROM forums ORDER BY name")->fetchAll(PDO::FETCH_COLUMN)]); break;
-        case 'create_forum':
-            $name = trim($input['name'] ?? '');
-            if (!forum_name_valid($name)) { http_response_code(400); echo json_encode(['error'=>'Invalid forum name']); break; }
-            $exists = $db->prepare("SELECT 1 FROM forums WHERE name=:n");
-            $exists->execute([':n'=>$name]);
-            if (!$exists->fetchColumn()) {
-                $db->prepare("INSERT INTO forums (name,admin_id) VALUES (:n,:a)")->execute([':n'=>$name,':a'=>(int)$currentUser['id']]);
+            $name = preg_replace('/[^a-zA-Z0-9_\-]/', '', trim(api_field($input, 'display_name')));
+            if ($name === '' || strlen($name) > 30) {
+                http_response_code(400);
+                echo json_encode(['error' => 'display_name must be 1-30 alphanumeric / _ / - chars']);
+                break;
             }
-            echo json_encode(['ok'=>true,'forum'=>$name]); break;
+            $db->prepare("UPDATE users    SET display_name=:n WHERE token=:t")  ->execute([':n' => $name, ':t' => $currentUser['token']]);
+            $db->prepare("UPDATE posts    SET author=:n WHERE user_id=:uid")    ->execute([':n' => $name, ':uid' => (int)$currentUser['id']]);
+            $db->prepare("UPDATE comments SET author=:n WHERE user_id=:uid")    ->execute([':n' => $name, ':uid' => (int)$currentUser['id']]);
+            echo json_encode(['ok' => true, 'display_name' => $name]);
+            break;
+
+        case 'update_bio':
+            $bio = substr(trim(api_field($input, 'bio')), 0, 300);
+            $db->prepare("UPDATE users SET bio=:b WHERE token=:t")->execute([':b' => $bio, ':t' => $currentUser['token']]);
+            echo json_encode(['ok' => true, 'bio' => $bio]);
+            break;
+
+        case 'csrf':
+            echo json_encode(['csrf_token' => csrf_token(), 'display_name' => $displayName]);
+            break;
+
+        case 'forums':
+            $rows = $db->query("SELECT name, admin_id, created_at FROM forums ORDER BY name")->fetchAll(PDO::FETCH_ASSOC);
+            echo json_encode(['forums' => $rows]);
+            break;
+
+        case 'create_forum':
+            $name = trim(api_field($input, 'name'));
+            if (!forum_name_valid($name)) {
+                http_response_code(400);
+                echo json_encode(['error' => 'Invalid forum name (letters, numbers, hyphens, underscores; max 60)']);
+                break;
+            }
+            $exists = $db->prepare("SELECT 1 FROM forums WHERE name=:n");
+            $exists->execute([':n' => $name]);
+            if ($exists->fetchColumn()) {
+                http_response_code(409);
+                echo json_encode(['error' => 'Forum already exists']);
+                break;
+            }
+            $db->prepare("INSERT INTO forums (name, admin_id) VALUES (:n, :a)")
+               ->execute([':n' => $name, ':a' => (int)$currentUser['id']]);
+            echo json_encode(['ok' => true, 'forum' => $name]);
+            break;
+
+        case 'rename_forum':
+            $oldName = trim(api_field($input, 'forum'));
+            $newName = trim(api_field($input, 'new_name'));
+            if (!forum_name_valid($newName)) {
+                http_response_code(400); echo json_encode(['error' => 'Invalid new forum name']); break;
+            }
+            if (!is_forum_admin($db, $oldName, (int)$currentUser['id'])) {
+                http_response_code(403); echo json_encode(['error' => 'Forbidden — not forum admin']); break;
+            }
+            try {
+                $db->prepare("UPDATE forums SET name=:n WHERE name=:o")->execute([':n' => $newName, ':o' => $oldName]);
+                echo json_encode(['ok' => true, 'forum' => $newName]);
+            } catch (Exception $e) {
+                http_response_code(409); echo json_encode(['error' => 'Forum name already taken']);
+            }
+            break;
+
+        case 'delete_forum':
+            $fn = trim(api_field($input, 'forum'));
+            if (!is_forum_admin($db, $fn, (int)$currentUser['id'])) {
+                http_response_code(403); echo json_encode(['error' => 'Forbidden — not forum admin']); break;
+            }
+            $fr = $db->prepare("SELECT id FROM forums WHERE name=:n");
+            $fr->execute([':n' => $fn]);
+            $fid = (int)$fr->fetchColumn();
+            if (!$fid) { http_response_code(404); echo json_encode(['error' => 'Forum not found']); break; }
+            $ps = $db->prepare("SELECT id FROM posts WHERE forum_id=:fid");
+            $ps->execute([':fid' => $fid]);
+            foreach ($ps->fetchAll(PDO::FETCH_COLUMN) as $pid) {
+                $db->prepare("DELETE FROM comments WHERE post_id=:pid")->execute([':pid' => $pid]);
+                $db->prepare("DELETE FROM votes    WHERE post_id=:pid")->execute([':pid' => $pid]);
+            }
+            $db->prepare("DELETE FROM posts  WHERE forum_id=:fid")->execute([':fid' => $fid]);
+            $db->prepare("DELETE FROM forums WHERE id=:fid")      ->execute([':fid' => $fid]);
+            echo json_encode(['ok' => true]);
+            break;
+
         case 'posts':
-            $fn=$_GET['forum']??'general'; $lim=min((int)($_GET['limit']??20),100); $off=max((int)($_GET['offset']??0),0);
-            $s=$db->prepare("SELECT id,forum_id,author,user_id,content,votes,created_at,CASE WHEN image_data IS NOT NULL THEN 1 ELSE 0 END AS has_image FROM posts JOIN forums ON posts.forum_id=forums.id WHERE forums.name=:f ORDER BY created_at DESC LIMIT :l OFFSET :o");
-            $s->bindValue(':f',$fn); $s->bindValue(':l',$lim,PDO::PARAM_INT); $s->bindValue(':o',$off,PDO::PARAM_INT); $s->execute();
-            echo json_encode(['posts'=>$s->fetchAll(PDO::FETCH_ASSOC),'limit'=>$lim,'offset'=>$off]); break;
+            $fn  = $_GET['forum']  ?? 'general';
+            $lim = min((int)($_GET['limit']  ?? 20), 100);
+            $off = max((int)($_GET['offset'] ?? 0),  0);
+            $s = $db->prepare(
+                "SELECT p.id, p.forum_id, p.author, p.user_id, p.content, p.votes, p.created_at,
+                        CASE WHEN p.image_data IS NOT NULL THEN 1 ELSE 0 END AS has_image
+                 FROM posts p
+                 JOIN forums f ON p.forum_id = f.id
+                 WHERE f.name = :f
+                 ORDER BY p.created_at DESC
+                 LIMIT :l OFFSET :o"
+            );
+            $s->bindValue(':f', $fn);
+            $s->bindValue(':l', $lim, PDO::PARAM_INT);
+            $s->bindValue(':o', $off, PDO::PARAM_INT);
+            $s->execute();
+            echo json_encode(['posts' => $s->fetchAll(PDO::FETCH_ASSOC), 'limit' => $lim, 'offset' => $off]);
+            break;
+
         case 'create_post':
-            $fn=trim($input['forum']??''); $ct=trim($input['content']??'');
-            if (!$fn||!$ct) { http_response_code(400); echo json_encode(['error'=>'forum and content required']); break; }
-            if (strlen($ct)>10000) { http_response_code(400); echo json_encode(['error'=>'Content too long']); break; }
-            $db->prepare("INSERT OR IGNORE INTO forums (name,admin_id) VALUES (:n,:a)")->execute([':n'=>$fn,':a'=>(int)$currentUser['id']]);
-            $db->prepare("INSERT INTO posts (forum_id,author,user_id,content) VALUES ((SELECT id FROM forums WHERE name=:f),:a,:uid,:c)")
-               ->execute([':f'=>$fn,':a'=>$currentUser['display_name'],':uid'=>(int)$currentUser['id'],':c'=>$ct]);
-            echo json_encode(['ok'=>true,'post_id'=>(int)$db->lastInsertId()]); break;
+            $fn = trim(api_field($input, 'forum'));
+            $ct = trim(api_field($input, 'content'));
+            if (!$fn || !$ct) {
+                http_response_code(400); echo json_encode(['error' => 'forum and content are required']); break;
+            }
+            if (strlen($ct) > 10000) {
+                http_response_code(400); echo json_encode(['error' => 'Content exceeds 10 000 char limit']); break;
+            }
+            $fcheck = $db->prepare("SELECT id FROM forums WHERE name=:n");
+            $fcheck->execute([':n' => $fn]);
+            if (!$fcheck->fetchColumn()) {
+                http_response_code(404); echo json_encode(['error' => 'Forum not found']); break;
+            }
+            $imgData = null; $imgMime = null;
+            if (!empty($_FILES['post_image']['name'])) {
+                try {
+                    $img     = validate_image($_FILES['post_image']);
+                    $imgData = $img['data'];
+                    $imgMime = $img['mime'];
+                } catch (RuntimeException $e) {
+                    http_response_code(400); echo json_encode(['error' => $e->getMessage()]); break;
+                }
+            }
+            $db->prepare(
+                "INSERT INTO posts (forum_id, author, user_id, content, image_data, image_mime)
+                 VALUES ((SELECT id FROM forums WHERE name=:f), :a, :uid, :c, :id, :im)"
+            )->execute([
+                ':f'   => $fn,
+                ':a'   => $currentUser['display_name'],
+                ':uid' => (int)$currentUser['id'],
+                ':c'   => $ct,
+                ':id'  => $imgData,
+                ':im'  => $imgMime,
+            ]);
+            $newId = (int)$db->lastInsertId();
+            $pr = $db->prepare(
+                "SELECT id, author, user_id, content, votes, created_at,
+                        CASE WHEN image_data IS NOT NULL THEN 1 ELSE 0 END AS has_image
+                 FROM posts WHERE id=:id"
+            );
+            $pr->execute([':id' => $newId]);
+            echo json_encode(['ok' => true, 'post' => $pr->fetch(PDO::FETCH_ASSOC)]);
+            break;
+
         case 'delete_post':
-            $pid=(int)($input['post_id']??0);
-            if (!$pid) { http_response_code(400); echo json_encode(['error'=>'post_id required']); break; }
-            $r=$db->prepare("SELECT p.user_id,f.name AS forum_name FROM posts p JOIN forums f ON p.forum_id=f.id WHERE p.id=:id"); $r->execute([':id'=>$pid]); $p=$r->fetch(PDO::FETCH_ASSOC);
-            if (!$p) { http_response_code(404); echo json_encode(['error'=>'Post not found']); break; }
-            if ((int)$p['user_id']!==(int)$currentUser['id'] && !is_forum_admin($db,$p['forum_name'],(int)$currentUser['id'])) { http_response_code(403); echo json_encode(['error'=>'Forbidden']); break; }
-            $db->prepare("DELETE FROM comments WHERE post_id=:id")->execute([':id'=>$pid]);
-            $db->prepare("DELETE FROM votes WHERE post_id=:id")->execute([':id'=>$pid]);
-            $db->prepare("DELETE FROM posts WHERE id=:id")->execute([':id'=>$pid]);
-            echo json_encode(['ok'=>true]); break;
-        case 'user_profile':
-            $uid=(int)($_GET['uid']??0);
-            if (!$uid) { http_response_code(400); echo json_encode(['error'=>'uid required']); break; }
-            $pu=$db->prepare("SELECT id,display_name,bio,avatar_data,created_at,last_seen FROM users WHERE id=:id");
-            $pu->execute([':id'=>$uid]); $pur=$pu->fetch(PDO::FETCH_ASSOC);
-            if (!$pur) { http_response_code(404); echo json_encode(['error'=>'User not found']); break; }
-            $puf=$db->prepare("SELECT name FROM forums WHERE admin_id=:uid ORDER BY name");
-            $puf->execute([':uid'=>$uid]); $purForums=$puf->fetchAll(PDO::FETCH_COLUMN);
-            $pup=$db->prepare("SELECT p.id,p.content,p.votes,p.created_at,f.name AS forum_name FROM posts p JOIN forums f ON p.forum_id=f.id WHERE p.user_id=:uid ORDER BY p.created_at DESC LIMIT 20");
-            $pup->execute([':uid'=>$uid]); $purPosts=$pup->fetchAll(PDO::FETCH_ASSOC);
-            echo json_encode(['user'=>['id'=>(int)$pur['id'],'display_name'=>$pur['display_name'],'bio'=>$pur['bio'],
-                'has_avatar'=>!empty($pur['avatar_data']),'created_at'=>$pur['created_at'],'last_seen'=>$pur['last_seen'],
-                'admin_of'=>$purForums],'posts'=>$purPosts]); break;
+            $pid = (int)api_field($input, 'post_id', 0);
+            if (!$pid) { http_response_code(400); echo json_encode(['error' => 'post_id required']); break; }
+            $r = $db->prepare(
+                "SELECT p.user_id, f.name AS forum_name
+                 FROM posts p JOIN forums f ON p.forum_id=f.id WHERE p.id=:id"
+            );
+            $r->execute([':id' => $pid]);
+            $p = $r->fetch(PDO::FETCH_ASSOC);
+            if (!$p) { http_response_code(404); echo json_encode(['error' => 'Post not found']); break; }
+            if ((int)$p['user_id'] !== (int)$currentUser['id'] && !is_forum_admin($db, $p['forum_name'], (int)$currentUser['id'])) {
+                http_response_code(403); echo json_encode(['error' => 'Forbidden']); break;
+            }
+            $db->prepare("DELETE FROM comments WHERE post_id=:id")->execute([':id' => $pid]);
+            $db->prepare("DELETE FROM votes    WHERE post_id=:id")->execute([':id' => $pid]);
+            $db->prepare("DELETE FROM posts    WHERE id=:id")     ->execute([':id' => $pid]);
+            echo json_encode(['ok' => true]);
+            break;
+
         case 'comments':
-            $pid=(int)($_GET['post_id']??0); if (!$pid) { http_response_code(400); echo json_encode(['error'=>'post_id required']); break; }
-            $top=get_comments($db,$pid); foreach ($top as &$c) $c['replies']=get_comments($db,$pid,(int)$c['id']);
-            echo json_encode(['comments'=>$top]); break;
+            $pid = (int)($_GET['post_id'] ?? 0);
+            if (!$pid) { http_response_code(400); echo json_encode(['error' => 'post_id required']); break; }
+            $top = get_comments($db, $pid);
+            foreach ($top as &$c) $c['replies'] = get_comments($db, $pid, (int)$c['id']);
+            unset($c);
+            echo json_encode(['comments' => $top]);
+            break;
+
         case 'create_comment':
-            $pid=(int)($input['post_id']??0); $ct=trim($input['content']??''); $par=isset($input['parent_id'])?(int)$input['parent_id']:null;
-            if (!$pid||!$ct) { http_response_code(400); echo json_encode(['error'=>'post_id and content required']); break; }
-            if (strlen($ct)>5000) { http_response_code(400); echo json_encode(['error'=>'Comment too long']); break; }
-            $db->prepare("INSERT INTO comments (post_id,parent_id,author,user_id,content) VALUES (:pid,:par,:a,:uid,:c)")
-               ->execute([':pid'=>$pid,':par'=>$par,':a'=>$currentUser['display_name'],':uid'=>(int)$currentUser['id'],':c'=>$ct]);
-            echo json_encode(['ok'=>true,'comment_id'=>(int)$db->lastInsertId()]); break;
+            $pid = (int)api_field($input, 'post_id', 0);
+            $ct  = trim(api_field($input, 'content'));
+            $par = api_field($input, 'parent_id', null);
+            $par = ($par !== null && $par !== '') ? (int)$par : null;
+
+            if (!$pid || !$ct) {
+                http_response_code(400); echo json_encode(['error' => 'post_id and content are required']); break;
+            }
+            if (strlen($ct) > 5000) {
+                http_response_code(400); echo json_encode(['error' => 'Comment exceeds 5 000 char limit']); break;
+            }
+            $pex = $db->prepare("SELECT id FROM posts WHERE id=:id");
+            $pex->execute([':id' => $pid]);
+            if (!$pex->fetchColumn()) { http_response_code(404); echo json_encode(['error' => 'Post not found']); break; }
+            if ($par !== null) {
+                $parEx = $db->prepare("SELECT id FROM comments WHERE id=:id AND post_id=:pid");
+                $parEx->execute([':id' => $par, ':pid' => $pid]);
+                if (!$parEx->fetchColumn()) {
+                    http_response_code(400); echo json_encode(['error' => 'Invalid parent_id']); break;
+                }
+            }
+            $db->prepare(
+                "INSERT INTO comments (post_id, parent_id, author, user_id, content)
+                 VALUES (:pid, :par, :a, :uid, :c)"
+            )->execute([
+                ':pid' => $pid,
+                ':par' => $par,
+                ':a'   => $currentUser['display_name'],
+                ':uid' => (int)$currentUser['id'],
+                ':c'   => $ct,
+            ]);
+            $newCid = (int)$db->lastInsertId();
+            $cr = $db->prepare("SELECT * FROM comments WHERE id=:id");
+            $cr->execute([':id' => $newCid]);
+            echo json_encode(['ok' => true, 'comment' => $cr->fetch(PDO::FETCH_ASSOC)]);
+            break;
+
+        case 'delete_comment':
+            $cid = (int)api_field($input, 'comment_id', 0);
+            if (!$cid) { http_response_code(400); echo json_encode(['error' => 'comment_id required']); break; }
+            $cr = $db->prepare(
+                "SELECT c.user_id, f.name AS forum_name
+                 FROM comments c
+                 JOIN posts p    ON c.post_id    = p.id
+                 JOIN forums f   ON p.forum_id   = f.id
+                 WHERE c.id=:id"
+            );
+            $cr->execute([':id' => $cid]);
+            $com = $cr->fetch(PDO::FETCH_ASSOC);
+            if (!$com) { http_response_code(404); echo json_encode(['error' => 'Comment not found']); break; }
+            if ((int)$com['user_id'] !== (int)$currentUser['id'] && !is_forum_admin($db, $com['forum_name'], (int)$currentUser['id'])) {
+                http_response_code(403); echo json_encode(['error' => 'Forbidden']); break;
+            }
+            $db->prepare("DELETE FROM comments WHERE parent_id=:id")->execute([':id' => $cid]);
+            $db->prepare("DELETE FROM comments WHERE id=:id")       ->execute([':id' => $cid]);
+            echo json_encode(['ok' => true]);
+            break;
+
         case 'vote':
-            $pid=(int)($input['post_id']??0); $val=(int)($input['value']??0);
-            if (!$pid||!in_array($val,[1,-1],true)) { http_response_code(400); echo json_encode(['error'=>'post_id and value(1 or -1) required']); break; }
-            $voter=$currentUser['display_name'];
-            $chk=$db->prepare("SELECT id FROM votes WHERE post_id=:pid AND voter=:v"); $chk->execute([':pid'=>$pid,':v'=>$voter]);
-            if ($chk->fetch()) $db->prepare("UPDATE votes SET value=:val WHERE post_id=:pid AND voter=:v")->execute([':val'=>$val,':pid'=>$pid,':v'=>$voter]);
-            else $db->prepare("INSERT INTO votes (post_id,voter,value) VALUES (:pid,:v,:val)")->execute([':pid'=>$pid,':v'=>$voter,':val'=>$val]);
-            $db->prepare("UPDATE posts SET votes=(SELECT COALESCE(SUM(value),0) FROM votes WHERE post_id=:pid) WHERE id=:pid")->execute([':pid'=>$pid]);
-            $r=$db->prepare("SELECT votes FROM posts WHERE id=:pid"); $r->execute([':pid'=>$pid]);
-            echo json_encode(['ok'=>true,'votes'=>(int)$r->fetchColumn()]); break;
+            $pid = (int)api_field($input, 'post_id', 0);
+            $val = (int)api_field($input, 'value',   0);
+            if (!$pid || !in_array($val, [1, -1], true)) {
+                http_response_code(400); echo json_encode(['error' => 'post_id and value (1 or -1) required']); break;
+            }
+            $pex2 = $db->prepare("SELECT id FROM posts WHERE id=:id");
+            $pex2->execute([':id' => $pid]);
+            if (!$pex2->fetchColumn()) { http_response_code(404); echo json_encode(['error' => 'Post not found']); break; }
+            $voter = $currentUser['display_name'];
+            $chk   = $db->prepare("SELECT id FROM votes WHERE post_id=:pid AND voter=:v");
+            $chk->execute([':pid' => $pid, ':v' => $voter]);
+            if ($chk->fetch()) {
+                $db->prepare("UPDATE votes SET value=:val WHERE post_id=:pid AND voter=:v")
+                   ->execute([':val' => $val, ':pid' => $pid, ':v' => $voter]);
+            } else {
+                $db->prepare("INSERT INTO votes (post_id, voter, value) VALUES (:pid, :v, :val)")
+                   ->execute([':pid' => $pid, ':v' => $voter, ':val' => $val]);
+            }
+            $db->prepare("UPDATE posts SET votes=(SELECT COALESCE(SUM(value),0) FROM votes WHERE post_id=:pid) WHERE id=:pid")
+               ->execute([':pid' => $pid]);
+            $vr = $db->prepare("SELECT votes FROM posts WHERE id=:pid");
+            $vr->execute([':pid' => $pid]);
+            echo json_encode(['ok' => true, 'votes' => (int)$vr->fetchColumn()]);
+            break;
+
+        case 'user_profile':
+            $uid = (int)($_GET['uid'] ?? 0);
+            if (!$uid) { http_response_code(400); echo json_encode(['error' => 'uid required']); break; }
+            $pu = $db->prepare("SELECT id, display_name, bio, avatar_data, created_at, last_seen FROM users WHERE id=:id");
+            $pu->execute([':id' => $uid]);
+            $pur = $pu->fetch(PDO::FETCH_ASSOC);
+            if (!$pur) { http_response_code(404); echo json_encode(['error' => 'User not found']); break; }
+            $puf = $db->prepare("SELECT name FROM forums WHERE admin_id=:uid ORDER BY name");
+            $puf->execute([':uid' => $uid]);
+            $pup = $db->prepare(
+                "SELECT p.id, p.content, p.votes, p.created_at, f.name AS forum_name
+                 FROM posts p JOIN forums f ON p.forum_id=f.id
+                 WHERE p.user_id=:uid ORDER BY p.created_at DESC LIMIT 20"
+            );
+            $pup->execute([':uid' => $uid]);
+            echo json_encode([
+                'user' => [
+                    'id'           => (int)$pur['id'],
+                    'display_name' => $pur['display_name'],
+                    'bio'          => $pur['bio'],
+                    'has_avatar'   => !empty($pur['avatar_data']),
+                    'created_at'   => $pur['created_at'],
+                    'last_seen'    => $pur['last_seen'],
+                    'admin_of'     => $puf->fetchAll(PDO::FETCH_COLUMN),
+                ],
+                'posts' => $pup->fetchAll(PDO::FETCH_ASSOC),
+            ]);
+            break;
+
         default:
             http_response_code(404);
-            echo json_encode(['error'=>'Unknown action','public'=>['generate_token','login','forums','posts','comments','user_profile'],
-                              'authed'=>['me','rename','csrf','create_forum','create_post','delete_post','create_comment','vote']]);
+            echo json_encode([
+                'error'  => 'Unknown action',
+                'public' => ['generate_token', 'login', 'forums', 'posts', 'comments', 'user_profile'],
+                'authed' => ['me', 'rename', 'update_bio', 'csrf',
+                             'create_forum', 'rename_forum', 'delete_forum',
+                             'create_post', 'delete_post',
+                             'create_comment', 'delete_comment',
+                             'vote'],
+            ]);
     }
     exit;
 }
@@ -1173,15 +1452,15 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
                 <a href="index.php?forum=<?= urlencode($f) ?>"
                    class="forum-item px-3 py-2 rounded-lg text-sm transition-colors <?= $f===$forum?'forum-active':'forum-link' ?>"
                    data-name="<?= htmlspecialchars(strtolower($f)) ?>"
-                   <?= $fi >= 5 && $f !== $forum ? 'style="display:none" data-overflow="1"' : '' ?>>
+                   <?= $fi >= 3 && $f !== $forum ? 'style="display:none" data-overflow="1"' : '' ?>>
                     k/<?= htmlspecialchars($f) ?>
                 </a>
                 <?php endforeach; ?>
             </div>
-            <?php if (count($forums) > 5): ?>
+            <?php if (count($forums) > 3): ?>
             <button id="forum-show-more" class="mt-1.5 w-full text-xs py-1 rounded-lg transition-colors tab-inactive hover:opacity-80"
                 onclick="toggleMoreForums(this)">
-                + <?= count($forums) - 5 ?> more
+                + <?= count($forums) - 3 ?> more
             </button>
             <?php endif; ?>
         </div>
