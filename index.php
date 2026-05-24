@@ -51,6 +51,14 @@ $db->exec("CREATE TABLE IF NOT EXISTS comments (
     content    TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 )");
+$db->exec("CREATE TABLE IF NOT EXISTS direct_messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_id     INTEGER NOT NULL,
+    to_id       INTEGER NOT NULL,
+    content     TEXT NOT NULL,
+    read_at     DATETIME DEFAULT NULL,
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+)");
 
 
 // Migrations
@@ -216,6 +224,7 @@ if (!$currentUser && !empty($_COOKIE['user_token'])) {
     else setcookie('user_token', '', time() - 1, '/', '', false, true);
 }
 $displayName = $currentUser['display_name'] ?? '';
+if (!isset($_SESSION['dm_authorized'])) $_SESSION['dm_authorized'] = [];
 
 
 //  Image Serving
@@ -604,6 +613,42 @@ if ($isApi) {
             ]);
             break;
 
+        case 'send_dm':
+            csrf_verify();
+            $toId = (int)api_field($input, 'to_id', 0);
+            $ct   = trim(api_field($input, 'content', ''));
+            if (!$toId || $toId === (int)$currentUser['id'] || $ct === '' || strlen($ct) > 2000) {
+                http_response_code(400); echo json_encode(['error' => 'Invalid parameters']); break;
+            }
+            $toCheck = $db->prepare("SELECT id FROM users WHERE id=:id");
+            $toCheck->execute([':id' => $toId]);
+            if (!$toCheck->fetchColumn()) {
+                http_response_code(404); echo json_encode(['error' => 'User not found']); break;
+            }
+            $_SESSION['dm_authorized'][$toId] = true;
+            $db->prepare("INSERT INTO direct_messages (from_id,to_id,content) VALUES (:f,:t,:c)")
+               ->execute([':f'=>(int)$currentUser['id'],':t'=>$toId,':c'=>$ct]);
+            $newId = (int)$db->lastInsertId();
+            echo json_encode(['ok' => true, 'id' => $newId, 'created_at' => date('Y-m-d H:i:s')]);
+            break;
+
+        case 'poll_dm':
+            $withId = (int)($_GET['with_id'] ?? 0);
+            $afterId = (int)($_GET['after_id'] ?? 0);
+            if (!$withId || $withId === (int)$currentUser['id']) {
+                http_response_code(400); echo json_encode(['error' => 'Invalid with_id']); break;
+            }
+            $db->prepare("UPDATE direct_messages SET read_at=CURRENT_TIMESTAMP WHERE from_id=:f AND to_id=:t AND read_at IS NULL")
+               ->execute([':f'=>$withId,':t'=>(int)$currentUser['id']]);
+            $cs = $db->prepare("SELECT dm.*,u.display_name AS from_name FROM direct_messages dm JOIN users u ON dm.from_id=u.id WHERE ((dm.from_id=:a AND dm.to_id=:b) OR (dm.from_id=:b2 AND dm.to_id=:a2)) AND dm.id > :after ORDER BY dm.created_at ASC");
+            $cs->execute([':a'=>(int)$currentUser['id'], ':b'=>$withId, ':b2'=>$withId, ':a2'=>(int)$currentUser['id'], ':after'=>$afterId]);
+            $messages = $cs->fetchAll(PDO::FETCH_ASSOC);
+            $uc = $db->prepare("SELECT COUNT(*) FROM direct_messages WHERE to_id=:id AND read_at IS NULL");
+            $uc->execute([':id'=>(int)$currentUser['id']]);
+            $unreadCount = (int)$uc->fetchColumn();
+            echo json_encode(['messages' => $messages, 'unread_count' => $unreadCount]);
+            break;
+
         default:
             http_response_code(404);
             echo json_encode([
@@ -613,7 +658,7 @@ if ($isApi) {
                              'create_forum', 'rename_forum', 'delete_forum',
                              'create_post', 'delete_post',
                              'create_comment', 'delete_comment',
-                             'vote'],
+                             'vote', 'send_dm', 'poll_dm'],
             ]);
     }
     exit;
@@ -808,6 +853,38 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             header("Location: index.php?forum=".urlencode($forum)."#post".$pid); exit;
         }
+
+        // Init DM from profile
+        if (isset($_POST['init_dm'])) {
+            $targetId = (int)$_POST['init_dm'];
+            if ($targetId && $targetId !== (int)$currentUser['id']) {
+                $_SESSION['dm_authorized'][$targetId] = true;
+            }
+            header("Location: index.php?page=messages&with=".$targetId); exit;
+        }
+
+        // Send direct message
+        if (isset($_POST['dm_to_id'], $_POST['dm_content'])) {
+            $toId = (int)$_POST['dm_to_id'];
+            $ct   = trim($_POST['dm_content'] ?? '');
+            $isAjax = !empty($_POST['ajax']);
+            if ($toId && $toId !== (int)$currentUser['id'] && $ct !== '' && strlen($ct) <= 2000) {
+                $toCheck = $db->prepare("SELECT id FROM users WHERE id=:id");
+                $toCheck->execute([':id' => $toId]);
+                if ($toCheck->fetchColumn()) {
+                    $_SESSION['dm_authorized'][$toId] = true;
+                    $db->prepare("INSERT INTO direct_messages (from_id,to_id,content) VALUES (:f,:t,:c)")
+                       ->execute([':f'=>(int)$currentUser['id'],':t'=>$toId,':c'=>$ct]);
+                    if ($isAjax) {
+                        $newId = (int)$db->lastInsertId();
+                        header('Content-Type: application/json');
+                        echo json_encode(['ok' => true, 'id' => $newId, 'created_at' => date('Y-m-d H:i:s')]);
+                        exit;
+                    }
+                }
+            }
+            header("Location: index.php?page=messages&with=".$toId); exit;
+        }
     }
 }
 
@@ -874,6 +951,48 @@ if ($page === 'forum') {
     $isCurForumAdmin = $currentUser ? is_forum_admin($db, $forum, (int)$currentUser['id']) : false;
     $fa = $db->prepare("SELECT u.display_name FROM forums fo JOIN users u ON fo.admin_id=u.id WHERE fo.name=:n");
     $fa->execute([':n'=>$forum]); $forumAdminName = $fa->fetchColumn() ?: null;
+}
+
+
+// Messages page data
+$dmInbox = []; $dmConversation = []; $dmWithUser = null; $dmUnreadCount = 0; $dmDenied = false;
+if ($page === 'messages' && $currentUser) {
+    $myId = (int)$currentUser['id'];
+    $withId = isset($_GET['with']) ? (int)$_GET['with'] : 0;
+    if ($withId && $withId !== $myId) {
+        $wu = $db->prepare("SELECT id,display_name,avatar_data FROM users WHERE id=:id");
+        $wu->execute([':id'=>$withId]); $dmWithUser = $wu->fetch(PDO::FETCH_ASSOC) ?: null;
+        if ($dmWithUser) {
+            $hasExisting = $db->prepare("SELECT 1 FROM direct_messages WHERE (from_id=:a AND to_id=:b) OR (from_id=:b AND to_id=:a) LIMIT 1");
+            $hasExisting->execute([':a'=>$myId, ':b'=>$withId]);
+            $hasExistingOk = (bool)$hasExisting->fetchColumn();
+            $dmDenied = !$hasExistingOk && empty($_SESSION['dm_authorized'][$withId]);
+            if (!$dmDenied) {
+                $db->prepare("UPDATE direct_messages SET read_at=CURRENT_TIMESTAMP WHERE from_id=:f AND to_id=:t AND read_at IS NULL")
+                   ->execute([':f'=>$withId,':t'=>$myId]);
+                $cs = $db->prepare("SELECT dm.*,u.display_name AS from_name FROM direct_messages dm JOIN users u ON dm.from_id=u.id WHERE (dm.from_id=:a AND dm.to_id=:b) OR (dm.from_id=:b2 AND dm.to_id=:a2) ORDER BY dm.created_at ASC");
+                $cs->execute([':a'=>$myId,':b'=>$withId,':b2'=>$withId,':a2'=>$myId]);
+                $dmConversation = $cs->fetchAll(PDO::FETCH_ASSOC);
+            }
+        }
+    }
+    $ib = $db->prepare("
+        SELECT u.id AS other_id, u.display_name AS other_name, u.avatar_data,
+               dm.content AS last_msg, dm.created_at AS last_at,
+               SUM(CASE WHEN dm.from_id=u.id AND dm.to_id=:me AND dm.read_at IS NULL THEN 1 ELSE 0 END) AS unread
+        FROM direct_messages dm
+        JOIN users u ON u.id = CASE WHEN dm.from_id=:me2 THEN dm.to_id ELSE dm.from_id END
+        WHERE dm.from_id=:me3 OR dm.to_id=:me4
+        GROUP BY other_id
+        ORDER BY last_at DESC
+    ");
+    $ib->execute([':me'=>$myId,':me2'=>$myId,':me3'=>$myId,':me4'=>$myId]);
+    $dmInbox = $ib->fetchAll(PDO::FETCH_ASSOC);
+    $uc = $db->prepare("SELECT COUNT(*) FROM direct_messages WHERE to_id=:id AND read_at IS NULL");
+    $uc->execute([':id'=>$myId]); $dmUnreadCount = (int)$uc->fetchColumn();
+} elseif ($currentUser) {
+    $uc = $db->prepare("SELECT COUNT(*) FROM direct_messages WHERE to_id=:id AND read_at IS NULL");
+    $uc->execute([':id'=>(int)$currentUser['id']]); $dmUnreadCount = (int)$uc->fetchColumn();
 }
 
 
@@ -1077,6 +1196,10 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
                 <button type="submit" class="text-xs underline underline-offset-2" style="color:#ffaaaa">switch identity</button>
             </form>
             <span style="color:rgba(255,255,255,.2)">|</span>
+            <a href="index.php?page=messages" class="relative text-xs underline underline-offset-2" style="color:var(--teal-lightest)">
+                messages<?php if ($dmUnreadCount > 0): ?><span style="background:#ef4444;color:#fff;font-size:10px;padding:1px 5px;border-radius:10px;margin-left:4px;vertical-align:middle"><?= $dmUnreadCount ?></span><?php endif; ?>
+            </a>
+            <span style="color:rgba(255,255,255,.2)">|</span>
         <?php else: ?>
             <a href="index.php" class="text-xs underline underline-offset-2" style="color:var(--teal-lightest)">Sign in / Join</a>
             <span style="color:rgba(255,255,255,.2)">|</span>
@@ -1109,9 +1232,18 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
     <?php endif; ?>
 
     <?php if ($viewingOtherProfile): ?>
-    <a href="javascript:history.back()" class="inline-flex items-center gap-1 text-sm hover:underline" style="color:var(--teal-mid)">
-        ← Back
-    </a>
+    <div class="flex items-center gap-3">
+        <a href="javascript:history.back()" class="inline-flex items-center gap-1 text-sm hover:underline" style="color:var(--teal-mid)">
+            ← Back
+        </a>
+        <?php if ($currentUser): ?>
+        <form method="post" class="inline">
+            <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrfToken) ?>">
+            <input type="hidden" name="init_dm" value="<?= (int)$profileUser['id'] ?>">
+            <button type="submit" class="btn-primary text-xs px-3 py-1.5 rounded-lg font-medium">Send Message</button>
+        </form>
+        <?php endif; ?>
+    </div>
     <?php endif; ?>
 
     <!-- Profile card -->
@@ -1235,6 +1367,181 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
         </div>
     </div>
 </div>
+<?php endif; ?>
+
+<?php else: ?>
+
+<?php if ($page === 'messages' && $currentUser): ?>
+<!-- Messages Page -->
+<div class="max-w-4xl mx-auto p-4 md:p-6 mt-4 grid grid-cols-1 md:grid-cols-3 gap-5">
+
+    <!-- Inbox sidebar -->
+    <div class="md:col-span-1 space-y-2">
+        <h2 class="text-sm font-semibold uppercase tracking-widest mb-3" style="color:var(--teal-mid)">Conversations</h2>
+        <?php if ($dmInbox): ?>
+        <?php foreach ($dmInbox as $conv): ?>
+        <a href="index.php?page=messages&with=<?= (int)$conv['other_id'] ?>"
+           class="flex items-center gap-3 p-3 rounded-xl card shadow-sm hover:shadow transition-shadow <?= ((int)$conv['other_id']===(int)($_GET['with']??0))?'ring-2':''; ?>"
+           style="<?= ((int)$conv['other_id']===(int)($_GET['with']??0)) ? 'ring-color:var(--teal-mid)' : '' ?>">
+            <?php if (!empty($conv['avatar_data'])): ?>
+            <img src="index.php?img=avatar&id=<?= (int)$conv['other_id'] ?>" class="avatar-sm flex-shrink-0" alt="">
+            <?php else: ?>
+            <span class="avatar-sm-placeholder flex-shrink-0" style="background:var(--teal-lightest);color:var(--teal-darkest);width:32px;height:32px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-weight:700"><?= htmlspecialchars(mb_strtoupper(mb_substr($conv['other_name'],0,1))) ?></span>
+            <?php endif; ?>
+            <div class="min-w-0 flex-1">
+                <div class="flex items-center justify-between">
+                    <span class="text-sm font-medium truncate" style="color:var(--text-primary)"><?= htmlspecialchars($conv['other_name']) ?></span>
+                    <?php if ((int)$conv['unread'] > 0): ?>
+                    <span style="background:#ef4444;color:#fff;font-size:10px;padding:1px 6px;border-radius:10px;flex-shrink:0"><?= (int)$conv['unread'] ?></span>
+                    <?php endif; ?>
+                </div>
+                <p class="text-xs truncate mt-0.5" style="color:var(--text-muted)"><?= htmlspecialchars(mb_substr($conv['last_msg'],0,50)) ?></p>
+            </div>
+        </a>
+        <?php endforeach; ?>
+        <?php else: ?>
+        <p class="text-sm italic" style="color:var(--text-muted)">No conversations yet. Visit a user's profile to start one.</p>
+        <?php endif; ?>
+    </div>
+
+    <!-- Conversation panel -->
+    <div class="md:col-span-2">
+        <?php if ($dmWithUser && !$dmDenied): ?>
+        <div class="card shadow-sm rounded-xl flex flex-col" style="min-height:420px">
+            <!-- Convo header -->
+            <div class="flex items-center gap-3 p-4 border-b" style="border-color:var(--border-subtle)">
+                <?php if (!empty($dmWithUser['avatar_data'])): ?>
+                <img src="index.php?img=avatar&id=<?= (int)$dmWithUser['id'] ?>" class="avatar-sm flex-shrink-0" alt="">
+                <?php else: ?>
+                <span style="width:32px;height:32px;border-radius:50%;background:var(--teal-lightest);color:var(--teal-darkest);display:inline-flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;flex-shrink:0"><?= htmlspecialchars(mb_strtoupper(mb_substr($dmWithUser['display_name'],0,1))) ?></span>
+                <?php endif; ?>
+                <a href="index.php?page=profile&uid=<?= (int)$dmWithUser['id'] ?>" class="font-semibold hover:underline" style="color:var(--teal-mid)"><?= htmlspecialchars($dmWithUser['display_name']) ?></a>
+            </div>
+            <!-- Messages -->
+            <div class="flex-1 overflow-y-auto p-4 space-y-3" id="dm-scroll" style="max-height:380px">
+                <?php if ($dmConversation): ?>
+                <?php foreach ($dmConversation as $msg): ?>
+                <?php $isMine = (int)$msg['from_id'] === (int)$currentUser['id']; ?>
+                <div class="flex <?= $isMine ? 'justify-end' : 'justify-start' ?>">
+                    <div data-dm-id="<?= (int)$msg['id'] ?>" class="max-w-xs md:max-w-sm rounded-2xl px-4 py-2.5 text-sm"
+                         style="<?= $isMine ? 'background:var(--teal-mid);color:#fff' : 'background:var(--bg-subtle);color:var(--text-primary)' ?>">
+                        <p class="whitespace-pre-wrap break-words"><?= htmlspecialchars($msg['content']) ?></p>
+                        <p class="text-xs mt-1 opacity-70"><?= htmlspecialchars(substr($msg['created_at'],11,5)) ?></p>
+                    </div>
+                </div>
+                <?php endforeach; ?>
+                <?php else: ?>
+                <p class="text-sm italic text-center mt-8" style="color:var(--text-muted)">No messages yet. Say hello!</p>
+                <?php endif; ?>
+            </div>
+            <!-- Input -->
+            <div class="p-4 border-t" style="border-color:var(--border-subtle)">
+                <form id="dm-form" class="flex gap-2">
+                    <input type="hidden" name="dm_to_id" value="<?= (int)$dmWithUser['id'] ?>">
+                    <input type="text" id="dm-input" name="dm_content" maxlength="2000" required placeholder="Write a message…"
+                           class="flex-1 border rounded-xl px-3 py-2 text-sm" style="border-color:var(--border-color)">
+                    <button type="submit" class="btn-primary px-4 py-2 rounded-xl text-sm font-medium">Send</button>
+                </form>
+            </div>
+        </div>
+        <?php elseif ($dmDenied): ?>
+        <div class="card shadow-sm rounded-xl p-10 text-center" style="color:var(--text-muted)">
+            <p class="italic">This conversation is not available.</p>
+            <p class="text-xs mt-2">Start a conversation from a user's profile page.</p>
+        </div>
+        <?php else: ?>
+        <div class="card shadow-sm rounded-xl p-10 text-center italic" style="color:var(--text-muted)">
+            Select a conversation or visit someone's profile to start chatting.
+        </div>
+        <?php endif; ?>
+    </div>
+</div>
+<?php if ($dmWithUser && !$dmDenied): ?>
+<script>
+(function(){
+    var sc = document.getElementById('dm-scroll');
+    if (sc) sc.scrollTop = sc.scrollHeight;
+
+    var lastId = 0;
+    var msgs = sc.querySelectorAll('[data-dm-id]');
+    if (msgs.length) lastId = parseInt(msgs[msgs.length-1].getAttribute('data-dm-id'), 10);
+
+    function escHtml(s) {
+        var d = document.createElement('div');
+        d.textContent = s;
+        return d.innerHTML;
+    }
+
+    // Send
+    document.getElementById('dm-form').addEventListener('submit', function(e) {
+        e.preventDefault();
+        var input = document.getElementById('dm-input');
+        var content = input.value.trim();
+        if (!content) return;
+        var btn = this.querySelector('button');
+        btn.disabled = true;
+        var fd = new FormData();
+        fd.append('to_id', this.querySelector('[name="dm_to_id"]').value);
+        fd.append('content', content);
+        fetch('?action=send_dm&api=1', {
+            method: 'POST',
+            headers: {'X-CSRF-Token': <?= json_encode($csrfToken) ?>},
+            body: fd
+        })
+        .then(function(r){ return r.json(); })
+        .then(function(d) {
+            if (!d.ok) return;
+            input.value = '';
+            var div = document.createElement('div');
+            div.className = 'flex justify-end';
+            div.innerHTML = '<div data-dm-id="' + d.id + '" class="max-w-xs md:max-w-sm rounded-2xl px-4 py-2.5 text-sm" style="background:var(--teal-mid);color:#fff">' +
+                '<p class="whitespace-pre-wrap break-words">' + escHtml(content) + '</p>' +
+                '<p class="text-xs mt-1 opacity-70">' + (d.created_at || '').substr(11,5) + '</p></div>';
+            sc.appendChild(div);
+            sc.scrollTop = sc.scrollHeight;
+            lastId = d.id;
+        })
+        .finally(function(){ btn.disabled = false; });
+    });
+
+    // Poll
+    var withId = <?= json_encode((int)$_GET['with'] ?? 0) ?>;
+    setInterval(function() {
+        fetch('?action=poll_dm&api=1&with_id=' + withId + '&after_id=' + lastId)
+        .then(function(r){ return r.json(); })
+        .then(function(d) {
+            var badge = document.querySelector('a[href*="page=messages"] span');
+            if (badge) {
+                if (d.unread_count > 0) {
+                    badge.textContent = d.unread_count;
+                    badge.style.display = '';
+                } else {
+                    badge.style.display = 'none';
+                }
+            }
+            d.messages.forEach(function(m) {
+                var isMine = parseInt(m.from_id, 10) === <?= json_encode($currentUser ? (int)$currentUser['id'] : 0) ?>;
+                var div = document.createElement('div');
+                div.className = 'flex ' + (isMine ? 'justify-end' : 'justify-start');
+                div.innerHTML = '<div data-dm-id="' + m.id + '" class="max-w-xs md:max-w-sm rounded-2xl px-4 py-2.5 text-sm" style="' +
+                    (isMine ? 'background:var(--teal-mid);color:#fff' : 'background:var(--bg-subtle);color:var(--text-primary)') +
+                    '"><p class="whitespace-pre-wrap break-words">' + escHtml(m.content) + '</p>' +
+                    '<p class="text-xs mt-1 opacity-70">' + (m.created_at || '').substr(11,5) + '</p></div>';
+                sc.appendChild(div);
+                if (parseInt(m.id, 10) > lastId) lastId = parseInt(m.id, 10);
+            });
+            if (d.messages.length) sc.scrollTop = sc.scrollHeight;
+            d.messages.filter(function(m) { return parseInt(m.from_id, 10) !== <?= json_encode($currentUser ? (int)$currentUser['id'] : 0) ?>; }).forEach(function() {
+                var convLink = document.querySelector('a[href*="with=' + withId + '"]');
+                if (convLink) {
+                    var badge = convLink.querySelector('span[style*="background:#ef4444"]');
+                    if (badge) badge.remove();
+                }
+            });
+        });
+    }, 3000);
+})();
+</script>
 <?php endif; ?>
 
 <?php else: ?>
@@ -1476,6 +1783,7 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
         </div>
     </div>
 </div>
+<?php endif; /* messages vs forum page */ ?>
 <?php endif; ?>
 <?php else: ?>
 <div class="flex items-center justify-center min-h-screen">
