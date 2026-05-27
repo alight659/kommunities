@@ -152,7 +152,15 @@ function rotate_csrf(): void {
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 }
 
-// Image Validator and EXIF Stripper
+
+// Image Validator, EXIF Stripper and Compressor
+// Max dimension image (w x h)
+define('IMG_MAX_DIM', 1200);
+// JPEG/WebP re-encode quality (0-100).
+define('IMG_JPEG_QUALITY', 82);
+// PNG compression level (0-9).
+define('IMG_PNG_LEVEL', 7);
+
 function validate_image(array $file): array {
     if ($file['error'] !== UPLOAD_ERR_OK) throw new RuntimeException('Upload error: ' . $file['error']);
     if ($file['size'] > 2 * 1024 * 1024)  throw new RuntimeException('Image must be 2 MB or smaller');
@@ -167,12 +175,30 @@ function validate_image(array $file): array {
     if (function_exists('imagecreatefromstring')) {
         $img = imagecreatefromstring($raw);
         if (!$img) throw new RuntimeException('Invalid or corrupt image data');
+
+        $origW = imagesx($img);
+        $origH = imagesy($img);
+        $maxDim = IMG_MAX_DIM;
+        if ($origW > $maxDim || $origH > $maxDim) {
+            $ratio  = min($maxDim / $origW, $maxDim / $origH);
+            $newW   = (int)round($origW * $ratio);
+            $newH   = (int)round($origH * $ratio);
+            $resized = imagecreatetruecolor($newW, $newH);
+            imagealphablending($resized, false);
+            imagesavealpha($resized, true);
+            $transparent = imagecolorallocatealpha($resized, 0, 0, 0, 127);
+            imagefill($resized, 0, 0, $transparent);
+            imagecopyresampled($resized, $img, 0, 0, 0, 0, $newW, $newH, $origW, $origH);
+            imagedestroy($img);
+            $img = $resized;
+        }
+
         ob_start();
         match($mime) {
-            'image/jpeg' => imagejpeg($img, null, 85),
-            'image/png'  => imagepng($img,  null, 6),
+            'image/jpeg' => imagejpeg($img, null, IMG_JPEG_QUALITY),
+            'image/png'  => imagepng($img,  null, IMG_PNG_LEVEL),
             'image/gif'  => imagegif($img),
-            'image/webp' => imagewebp($img, null, 85),
+            'image/webp' => imagewebp($img, null, IMG_JPEG_QUALITY),
         };
         $clean = ob_get_clean();
         imagedestroy($img);
@@ -1259,8 +1285,8 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
             <div class="flex-1 min-w-0">
                 <h2 class="text-2xl font-bold" style="color:var(--teal-mid)"><?= htmlspecialchars($profileUser['display_name']) ?></h2>
                 <p class="text-xs mt-1" style="color:var(--text-muted)">
-                    Member since <?= htmlspecialchars(substr($profileUser['created_at'],0,10)) ?>
-                    · Last seen <?= htmlspecialchars(substr($profileUser['last_seen'],0,10)) ?>
+                    Member since <time class="utc-time utc-date" data-utc="<?= htmlspecialchars($profileUser['created_at']) ?>"><?= htmlspecialchars(substr($profileUser['created_at'],0,10)) ?></time>
+                    · Last seen <time class="utc-time utc-date" data-utc="<?= htmlspecialchars($profileUser['last_seen']) ?>"><?= htmlspecialchars(substr($profileUser['last_seen'],0,10)) ?></time>
                 </p>
                 <?php if ($profileForums): ?>
                 <p class="text-xs mt-1" style="color:var(--text-muted)">
@@ -1331,7 +1357,7 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
                 <p class="text-sm whitespace-pre-wrap" style="color:var(--text-primary)"><?= htmlspecialchars(mb_substr($pp['content'],0,200)) ?><?= mb_strlen($pp['content'])>200?'…':'' ?></p>
                 <p class="text-xs mt-1" style="color:var(--text-muted)">
                     in <a href="index.php?forum=<?= urlencode($pp['forum_name']) ?>" class="underline" style="color:var(--teal-mid)">k/<?= htmlspecialchars($pp['forum_name']) ?></a>
-                    · <?= htmlspecialchars(substr($pp['created_at'],0,16)) ?> · <?= (int)$pp['votes'] ?> votes
+                    · <time class="utc-time" data-utc="<?= htmlspecialchars($pp['created_at']) ?>"><?= htmlspecialchars(substr($pp['created_at'],0,16)) ?></time> · <?= (int)$pp['votes'] ?> votes
                 </p>
             </div>
             <?php endforeach; ?>
@@ -1426,7 +1452,7 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
                     <div data-dm-id="<?= (int)$msg['id'] ?>" class="max-w-xs md:max-w-sm rounded-2xl px-4 py-2.5 text-sm"
                          style="<?= $isMine ? 'background:var(--teal-mid);color:#fff' : 'background:var(--bg-subtle);color:var(--text-primary)' ?>">
                         <p class="whitespace-pre-wrap break-words"><?= htmlspecialchars($msg['content']) ?></p>
-                        <p class="text-xs mt-1 opacity-70"><?= htmlspecialchars(substr($msg['created_at'],11,5)) ?></p>
+                        <p class="text-xs mt-1 opacity-70"><time class="utc-time utc-hhmm" data-utc="<?= htmlspecialchars($msg['created_at']) ?>"><?= htmlspecialchars(substr($msg['created_at'],11,5)) ?></time></p>
                     </div>
                 </div>
                 <?php endforeach; ?>
@@ -1496,10 +1522,11 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
             div.className = 'flex justify-end';
             div.innerHTML = '<div data-dm-id="' + d.id + '" class="max-w-xs md:max-w-sm rounded-2xl px-4 py-2.5 text-sm" style="background:var(--teal-mid);color:#fff">' +
                 '<p class="whitespace-pre-wrap break-words">' + escHtml(content) + '</p>' +
-                '<p class="text-xs mt-1 opacity-70">' + (d.created_at || '').substr(11,5) + '</p></div>';
+                '<p class="text-xs mt-1 opacity-70"><time class="utc-time utc-hhmm" data-utc="' + escHtml(d.created_at || '') + '">' + (d.created_at || '').substr(11,5) + '</time></p></div>';
             sc.appendChild(div);
             sc.scrollTop = sc.scrollHeight;
             lastId = d.id;
+            if (window.localiseUtcTimes) window.localiseUtcTimes();
         })
         .finally(function(){ btn.disabled = false; });
     });
@@ -1526,11 +1553,14 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
                 div.innerHTML = '<div data-dm-id="' + m.id + '" class="max-w-xs md:max-w-sm rounded-2xl px-4 py-2.5 text-sm" style="' +
                     (isMine ? 'background:var(--teal-mid);color:#fff' : 'background:var(--bg-subtle);color:var(--text-primary)') +
                     '"><p class="whitespace-pre-wrap break-words">' + escHtml(m.content) + '</p>' +
-                    '<p class="text-xs mt-1 opacity-70">' + (m.created_at || '').substr(11,5) + '</p></div>';
+                    '<p class="text-xs mt-1 opacity-70"><time class="utc-time utc-hhmm" data-utc="' + escHtml(m.created_at || '') + '">' + (m.created_at || '').substr(11,5) + '</time></p></div>';
                 sc.appendChild(div);
                 if (parseInt(m.id, 10) > lastId) lastId = parseInt(m.id, 10);
             });
-            if (d.messages.length) sc.scrollTop = sc.scrollHeight;
+            if (d.messages.length) {
+                sc.scrollTop = sc.scrollHeight;
+                if (window.localiseUtcTimes) window.localiseUtcTimes();
+            }
             d.messages.filter(function(m) { return parseInt(m.from_id, 10) !== <?= json_encode($currentUser ? (int)$currentUser['id'] : 0) ?>; }).forEach(function() {
                 var convLink = document.querySelector('a[href*="with=' + withId + '"]');
                 if (convLink) {
@@ -1674,7 +1704,7 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
                 <?php endif; ?>
                 <p class="text-xs mt-2 mb-4" style="color:var(--text-muted)">
                     by <?php if ($post['user_id']): ?><a href="index.php?page=profile&uid=<?= (int)$post['user_id'] ?>" class="font-medium hover:underline" style="color:var(--text-author)"><?= htmlspecialchars($post['author']) ?></a><?php else: ?><span class="font-medium" style="color:var(--text-author)"><?= htmlspecialchars($post['author']) ?></span><?php endif; ?>
-                    · <?= htmlspecialchars($post['created_at']) ?>
+                    · <time class="utc-time" data-utc="<?= htmlspecialchars($post['created_at']) ?>"><?= htmlspecialchars($post['created_at']) ?></time>
                 </p>
                 <!-- Comments -->
                 <div id="comments-<?= (int)$post['id'] ?>" class="space-y-3 border-t pt-4" style="border-color:var(--border-subtle)">
@@ -1683,7 +1713,7 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
                         <p class="text-sm whitespace-pre-wrap" style="color:var(--text-primary)"><?= htmlspecialchars($comment['content']) ?></p>
                         <p class="text-xs" style="color:var(--text-muted)">
                             <?php if ($comment['user_id']): ?><a href="index.php?page=profile&uid=<?= (int)$comment['user_id'] ?>" class="font-medium hover:underline" style="color:var(--text-author)"><?= htmlspecialchars($comment['author']) ?></a><?php else: ?><span class="font-medium" style="color:var(--text-author)"><?= htmlspecialchars($comment['author']) ?></span><?php endif; ?>
-                            · <?= htmlspecialchars($comment['created_at']) ?>
+                            · <time class="utc-time" data-utc="<?= htmlspecialchars($comment['created_at']) ?>"><?= htmlspecialchars($comment['created_at']) ?></time>
                         </p>
                         <div id="replies-<?= (int)$comment['id'] ?>" class="space-y-2">
                         <?php foreach (get_comments($db, (int)$post['id'], (int)$comment['id']) as $reply): ?>
@@ -1691,7 +1721,7 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
                             <p class="text-sm whitespace-pre-wrap" style="color:var(--text-primary)"><?= htmlspecialchars($reply['content']) ?></p>
                             <p class="text-xs mt-1" style="color:var(--text-muted)">
                                 <?php if ($reply['user_id']): ?><a href="index.php?page=profile&uid=<?= (int)$reply['user_id'] ?>" class="font-medium hover:underline" style="color:var(--text-author)"><?= htmlspecialchars($reply['author']) ?></a><?php else: ?><span class="font-medium" style="color:var(--text-author)"><?= htmlspecialchars($reply['author']) ?></span><?php endif; ?>
-                                · <?= htmlspecialchars($reply['created_at']) ?>
+                                · <time class="utc-time" data-utc="<?= htmlspecialchars($reply['created_at']) ?>"><?= htmlspecialchars($reply['created_at']) ?></time>
                             </p>
                         </div>
                         <?php endforeach; ?>
@@ -2113,6 +2143,63 @@ function toggleMoreForums(btn) {
 </script>
 
 <style>@keyframes fadeIn{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}</style>
+
+<script>
+// UTC-to-local timestamp converter.
+(function() {
+    function parseUtc(s) {
+        if (!s) return null;
+        return new Date(s.replace(' ', 'T') + 'Z');
+    }
+
+    function fmtFull(d) {
+        return d.toLocaleString(undefined, {
+            year: 'numeric', month: 'short', day: 'numeric',
+            hour: '2-digit', minute: '2-digit'
+        });
+    }
+
+    function fmtDate(d) {
+        return d.toLocaleDateString(undefined, {
+            year: 'numeric', month: 'short', day: 'numeric'
+        });
+    }
+
+    function fmtHHMM(d) {
+        return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+    }
+
+    function localise(el) {
+        var raw = el.getAttribute('data-utc');
+        if (!raw) return;
+        var d = parseUtc(raw);
+        if (!d || isNaN(d)) return;
+        if (el.classList.contains('utc-date')) {
+            el.textContent = fmtDate(d);
+        } else if (el.classList.contains('utc-hhmm')) {
+            el.textContent = fmtHHMM(d);
+        } else {
+            el.textContent = fmtFull(d);
+        }
+        el.title = raw + ' UTC';
+    }
+
+    function localiseAll() {
+        document.querySelectorAll('time.utc-time:not([data-localised])').forEach(function(el) {
+            localise(el);
+            el.setAttribute('data-localised', '1');
+        });
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', localiseAll);
+    } else {
+        localiseAll();
+    }
+
+    window.localiseUtcTimes = localiseAll;
+})();
+</script>
 <footer class="text-center text-xs py-6 mt-4" style="color:var(--text-muted)">
     <span style="display: inline-block; transform: rotateY(180deg);">&copy;</span> CopyLeft <?= date('Y') ?> Kommunities
 </footer>
