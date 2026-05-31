@@ -137,6 +137,26 @@ function get_comments(PDO $db, int $post_id, ?int $parent_id = null): array {
     $s->execute([':pid' => $post_id, ':par' => $parent_id]);
     return $s->fetchAll(PDO::FETCH_ASSOC);
 }
+function render_mentions(PDO $db, string $text): string {
+    return preg_replace_callback(
+        '/@([\w\-]{1,30})/',
+        function (array $m) use ($db): string {
+            $name = $m[1];
+            $s = $db->prepare("SELECT id FROM users WHERE display_name=:n LIMIT 1");
+            $s->execute([':n' => $name]);
+            $uid = $s->fetchColumn();
+            $safe = htmlspecialchars('@' . $name);
+            if ($uid) {
+                return '<a href="index.php?page=profile&uid=' . (int)$uid . '" '
+                     . 'class="mention-link font-semibold" '
+                     . 'style="color:var(--teal-mid)">' . $safe . '</a>';
+            }
+            return $safe;
+        },
+        htmlspecialchars($text)
+    );
+}
+
 function forum_name_valid(string $name): bool {
     return $name !== '' && strlen($name) <= 60 && preg_match('/^[\w\-]+$/', $name);
 }
@@ -322,7 +342,7 @@ if ($isApi) {
         exit;
     }
 
-    $publicActions = ['forums', 'posts', 'comments', 'user_profile'];
+    $publicActions = ['forums', 'posts', 'comments', 'user_profile', 'search_users', 'search_posts'];
 
     if (!in_array($action, $publicActions, true) && !$currentUser) {
         http_response_code(401);
@@ -432,6 +452,57 @@ if ($isApi) {
             echo json_encode(['ok' => true]);
             break;
 
+        case 'search_posts':
+            $q   = trim($_GET['q'] ?? '');
+            $fn  = trim($_GET['forum'] ?? '');
+            $lim = min((int)($_GET['limit']  ?? 20), 100);
+            $off = max((int)($_GET['offset'] ?? 0),  0);
+            if ($q === '') {
+                http_response_code(400); echo json_encode(['error' => 'q (query) is required']); break;
+            }
+            $like = '%' . str_replace(['%','_'], ['\\%','\\_'], $q) . '%';
+            if ($fn !== '') {
+                $sp = $db->prepare(
+                    "SELECT p.id, p.forum_id, p.author, p.user_id, p.content, p.votes, p.created_at,
+                            f.name AS forum_name,
+                            CASE WHEN p.image_data IS NOT NULL THEN 1 ELSE 0 END AS has_image
+                     FROM posts p JOIN forums f ON p.forum_id = f.id
+                     WHERE f.name = :fn AND p.content LIKE :q ESCAPE '\\'
+                     ORDER BY p.created_at DESC
+                     LIMIT :l OFFSET :o"
+                );
+                $sp->bindValue(':fn', $fn);
+            } else {
+                $sp = $db->prepare(
+                    "SELECT p.id, p.forum_id, p.author, p.user_id, p.content, p.votes, p.created_at,
+                            f.name AS forum_name,
+                            CASE WHEN p.image_data IS NOT NULL THEN 1 ELSE 0 END AS has_image
+                     FROM posts p JOIN forums f ON p.forum_id = f.id
+                     WHERE p.content LIKE :q ESCAPE '\\'
+                     ORDER BY p.created_at DESC
+                     LIMIT :l OFFSET :o"
+                );
+            }
+            $sp->bindValue(':q', $like);
+            $sp->bindValue(':l', $lim, PDO::PARAM_INT);
+            $sp->bindValue(':o', $off, PDO::PARAM_INT);
+            $sp->execute();
+            $rows = $sp->fetchAll(PDO::FETCH_ASSOC);
+            foreach ($rows as &$row) {
+                if ($row['has_image']) $row['image_url'] = 'index.php?img=post&id=' . $row['id'];
+            }
+            unset($row);
+            if ($fn !== '') {
+                $ct = $db->prepare("SELECT COUNT(*) FROM posts p JOIN forums f ON p.forum_id=f.id WHERE f.name=:fn AND p.content LIKE :q ESCAPE '\\'");
+                $ct->bindValue(':fn', $fn);
+            } else {
+                $ct = $db->prepare("SELECT COUNT(*) FROM posts p WHERE p.content LIKE :q ESCAPE '\\'");
+            }
+            $ct->bindValue(':q', $like);
+            $ct->execute();
+            echo json_encode(['posts' => $rows, 'total' => (int)$ct->fetchColumn(), 'limit' => $lim, 'offset' => $off, 'q' => $q]);
+            break;
+
         case 'posts':
             $fn  = $_GET['forum']  ?? 'general';
             $lim = min((int)($_GET['limit']  ?? 20), 100);
@@ -449,7 +520,14 @@ if ($isApi) {
             $s->bindValue(':l', $lim, PDO::PARAM_INT);
             $s->bindValue(':o', $off, PDO::PARAM_INT);
             $s->execute();
-            echo json_encode(['posts' => $s->fetchAll(PDO::FETCH_ASSOC), 'limit' => $lim, 'offset' => $off]);
+            $rows = $s->fetchAll(PDO::FETCH_ASSOC);
+            foreach ($rows as &$row) {
+                if ($row['has_image']) {
+                    $row['image_url'] = 'index.php?img=post&id=' . $row['id'];
+                }
+            }
+            unset($row);
+            echo json_encode(['posts' => $rows, 'limit' => $lim, 'offset' => $off]);
             break;
 
         case 'create_post':
@@ -494,7 +572,11 @@ if ($isApi) {
                  FROM posts WHERE id=:id"
             );
             $pr->execute([':id' => $newId]);
-            echo json_encode(['ok' => true, 'post' => $pr->fetch(PDO::FETCH_ASSOC)]);
+            $newPost = $pr->fetch(PDO::FETCH_ASSOC);
+            if ($newPost['has_image']) {
+                $newPost['image_url'] = 'index.php?img=post&id=' . $newPost['id'];
+            }
+            echo json_encode(['ok' => true, 'post' => $newPost]);
             break;
 
         case 'delete_post':
@@ -610,9 +692,30 @@ if ($isApi) {
             echo json_encode(['ok' => true, 'votes' => (int)$vr->fetchColumn()]);
             break;
 
+        case 'search_users':
+            $q = trim($_GET['q'] ?? '');
+            if ($q === '' || strlen($q) < 1) {
+                echo json_encode(['users' => []]); break;
+            }
+            $su = $db->prepare(
+                "SELECT id, display_name FROM users
+                 WHERE display_name LIKE :q
+                 ORDER BY display_name ASC LIMIT 10"
+            );
+            $su->execute([':q' => $q . '%']);
+            $matches = $su->fetchAll(PDO::FETCH_ASSOC);
+            echo json_encode(['users' => $matches]);
+            break;
+
         case 'user_profile':
-            $uid = (int)($_GET['uid'] ?? 0);
-            if (!$uid) { http_response_code(400); echo json_encode(['error' => 'uid required']); break; }
+            $uid      = (int)($_GET['uid'] ?? 0);
+            $username = trim($_GET['username'] ?? '');
+            if (!$uid && $username !== '') {
+                $lu = $db->prepare("SELECT id FROM users WHERE display_name=:n LIMIT 1");
+                $lu->execute([':n' => $username]);
+                $uid = (int)($lu->fetchColumn() ?: 0);
+            }
+            if (!$uid) { http_response_code(400); echo json_encode(['error' => 'uid or username required']); break; }
             $pu = $db->prepare("SELECT id, display_name, bio, avatar_data, created_at, last_seen FROM users WHERE id=:id");
             $pu->execute([':id' => $uid]);
             $pur = $pu->fetch(PDO::FETCH_ASSOC);
@@ -679,7 +782,7 @@ if ($isApi) {
             http_response_code(404);
             echo json_encode([
                 'error'  => 'Unknown action',
-                'public' => ['generate_token', 'login', 'forums', 'posts', 'comments', 'user_profile'],
+                'public' => ['generate_token', 'login', 'forums', 'posts', 'search_posts', 'comments', 'user_profile', 'search_users'],
                 'authed' => ['me', 'rename', 'update_bio', 'csrf',
                              'create_forum', 'rename_forum', 'delete_forum',
                              'create_post', 'delete_post',
@@ -1123,6 +1226,8 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
         .avatar-sm-placeholder { width:28px; height:28px; border-radius:50%; background:rgba(255,255,255,.2); display:inline-flex; align-items:center; justify-content:center; font-size:13px; font-weight:700; }
         #forum-search { transition: border-color .15s, box-shadow .15s; }
         #forum-show-more { cursor: pointer; }
+        .mention-link { color: var(--teal-mid); font-weight: 600; }
+        .mention-link:hover { text-decoration: underline; }
     </style>
 </head>
 <body class="min-h-screen">
@@ -1664,6 +1769,26 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
             </form>
         </div>
 
+        <!-- Posts Search -->
+        <div class="card shadow-sm rounded-xl p-4">
+            <div class="flex gap-2 items-center">
+                <div class="relative flex-1">
+                    <input type="text" id="post-search-input" placeholder="Search posts…" autocomplete="off" maxlength="200"
+                        class="w-full border rounded-lg pl-8 pr-3 py-2 text-sm"
+                        style="border-color:var(--border-color);background:var(--input-bg);color:var(--input-text)">
+                    <svg class="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 pointer-events-none" style="color:var(--text-muted)" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-4.35-4.35M17 11A6 6 0 1 1 5 11a6 6 0 0 1 12 0z"/>
+                    </svg>
+                </div>
+                <label class="flex items-center gap-1.5 text-xs select-none cursor-pointer" style="color:var(--text-secondary)" title="Search all forums instead of just this one">
+                    <input type="checkbox" id="post-search-global" class="rounded">
+                    all forums
+                </label>
+                <button id="post-search-clear" class="btn-secondary text-xs px-3 py-2 rounded-lg hidden">Clear</button>
+            </div>
+            <div id="post-search-status" class="text-xs mt-2 hidden" style="color:var(--text-muted)"></div>
+        </div>
+
         <!-- Posts -->
         <div id="posts-list" class="space-y-5">
         <?php if ($posts): ?>
@@ -1693,7 +1818,7 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
             <!-- Post content -->
             <div class="flex-1 p-5">
                 <div class="flex items-start justify-between gap-2">
-                    <p class="flex-1 whitespace-pre-wrap" style="color:var(--text-primary)"><?= htmlspecialchars($post['content']) ?></p>
+                    <p class="flex-1 whitespace-pre-wrap" style="color:var(--text-primary)"><?= render_mentions($db, $post['content']) ?></p>
                     <?php if ($canDelete): ?>
                     <button onclick="document.getElementById('dpm<?= (int)$post['id'] ?>').classList.remove('hidden')"
                         class="flex-shrink-0 btn-danger text-xs px-2 py-1 rounded opacity-70 hover:opacity-100 ml-2">Delete</button>
@@ -1710,7 +1835,7 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
                 <div id="comments-<?= (int)$post['id'] ?>" class="space-y-3 border-t pt-4" style="border-color:var(--border-subtle)">
                     <?php foreach (get_comments($db, (int)$post['id']) as $comment): ?>
                     <div id="comment-<?= (int)$comment['id'] ?>" class="rounded-lg p-3 space-y-2" style="background:var(--bg-subtle)">
-                        <p class="text-sm whitespace-pre-wrap" style="color:var(--text-primary)"><?= htmlspecialchars($comment['content']) ?></p>
+                        <p class="text-sm whitespace-pre-wrap" style="color:var(--text-primary)"><?= render_mentions($db, $comment['content']) ?></p>
                         <p class="text-xs" style="color:var(--text-muted)">
                             <?php if ($comment['user_id']): ?><a href="index.php?page=profile&uid=<?= (int)$comment['user_id'] ?>" class="font-medium hover:underline" style="color:var(--text-author)"><?= htmlspecialchars($comment['author']) ?></a><?php else: ?><span class="font-medium" style="color:var(--text-author)"><?= htmlspecialchars($comment['author']) ?></span><?php endif; ?>
                             · <time class="utc-time" data-utc="<?= htmlspecialchars($comment['created_at']) ?>"><?= htmlspecialchars($comment['created_at']) ?></time>
@@ -1718,7 +1843,7 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
                         <div id="replies-<?= (int)$comment['id'] ?>" class="space-y-2">
                         <?php foreach (get_comments($db, (int)$post['id'], (int)$comment['id']) as $reply): ?>
                         <div class="rounded-lg p-2.5 ml-4" style="background:var(--reply-bg);border:1px solid var(--reply-border)">
-                            <p class="text-sm whitespace-pre-wrap" style="color:var(--text-primary)"><?= htmlspecialchars($reply['content']) ?></p>
+                            <p class="text-sm whitespace-pre-wrap" style="color:var(--text-primary)"><?= render_mentions($db, $reply['content']) ?></p>
                             <p class="text-xs mt-1" style="color:var(--text-muted)">
                                 <?php if ($reply['user_id']): ?><a href="index.php?page=profile&uid=<?= (int)$reply['user_id'] ?>" class="font-medium hover:underline" style="color:var(--text-author)"><?= htmlspecialchars($reply['author']) ?></a><?php else: ?><span class="font-medium" style="color:var(--text-author)"><?= htmlspecialchars($reply['author']) ?></span><?php endif; ?>
                                 · <time class="utc-time" data-utc="<?= htmlspecialchars($reply['created_at']) ?>"><?= htmlspecialchars($reply['created_at']) ?></time>
@@ -1813,7 +1938,7 @@ unset($_SESSION['new_token_show'], $_SESSION['post_error'], $_SESSION['profile_e
         </div>
     </div>
 </div>
-<?php endif; /* messages vs forum page */ ?>
+<?php endif; ?>
 <?php endif; ?>
 <?php else: ?>
 <div class="flex items-center justify-center min-h-screen">
@@ -1912,10 +2037,169 @@ function toggleMoreForums(btn) {
             .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
 
+    var mentionCache = {};
+
+    function renderMentions(html) {
+        return html.replace(/@([\w\-]{1,30})/g, function(match, name) {
+            var uid = mentionCache[name.toLowerCase()];
+            if (uid) {
+                return '<a href="index.php?page=profile&uid=' + escHtml(String(uid)) + '" ' +
+                       'class="mention-link font-semibold" style="color:var(--teal-mid)">@' + escHtml(name) + '</a>';
+            }
+            return '<span class="mention-link font-semibold" style="color:var(--teal-mid)">@' + escHtml(name) + '</span>';
+        });
+    }
+
+    function contentHtml(text) {
+        return renderMentions(escHtml(text));
+    }
+
     function authorHtml(uid, name) {
         if (!uid) return '<span class="font-medium" style="color:var(--text-author)">' + escHtml(name) + '</span>';
         return '<a href="index.php?page=profile&uid=' + escHtml(uid) + '" class="font-medium hover:underline" style="color:var(--text-author)">' + escHtml(name) + '</a>';
     }
+
+    // @mention autocomplete
+    var mentionDropdown = null;
+    var mentionTarget   = null;
+    var mentionStart    = -1;
+
+    function createDropdown() {
+        var el = document.createElement('div');
+        el.id = 'mention-dropdown';
+        el.style.cssText = 'position:absolute;z-index:9999;background:var(--modal-bg);border:1px solid var(--border-color);border-radius:10px;box-shadow:0 4px 20px rgba(0,0,0,.15);min-width:180px;max-height:200px;overflow-y:auto;display:none';
+        document.body.appendChild(el);
+        return el;
+    }
+
+    function positionDropdown(input) {
+        if (!mentionDropdown) return;
+        var r = input.getBoundingClientRect();
+        mentionDropdown.style.left = (r.left + window.scrollX) + 'px';
+        mentionDropdown.style.top  = (r.bottom + window.scrollY + 4) + 'px';
+        mentionDropdown.style.width = Math.min(r.width, 260) + 'px';
+    }
+
+    function hideMentionDropdown() {
+        if (mentionDropdown) mentionDropdown.style.display = 'none';
+        mentionTarget = null;
+        mentionStart  = -1;
+    }
+
+    function insertMention(input, name) {
+        var val   = input.value;
+        var cur   = input.selectionStart;
+        var before = val.slice(0, mentionStart);
+        var after  = val.slice(cur);
+        input.value = before + '@' + name + ' ' + after;
+        var pos = (before + '@' + name + ' ').length;
+        input.setSelectionRange(pos, pos);
+        input.focus();
+        hideMentionDropdown();
+    }
+
+    function showMentionResults(users, input) {
+        if (!mentionDropdown) mentionDropdown = createDropdown();
+        mentionDropdown.innerHTML = '';
+        if (!users.length) { mentionDropdown.style.display = 'none'; return; }
+        users.forEach(function(u) {
+            mentionCache[u.display_name.toLowerCase()] = u.id;
+            var item = document.createElement('div');
+            item.style.cssText = 'padding:8px 12px;cursor:pointer;font-size:13px;color:var(--text-primary);transition:background .1s';
+            item.innerHTML = '<span style="color:var(--teal-mid);font-weight:600">@' + escHtml(u.display_name) + '</span>';
+            item.addEventListener('mouseenter', function() { item.style.background = 'var(--forum-hover)'; });
+            item.addEventListener('mouseleave', function() { item.style.background = ''; });
+            item.addEventListener('mousedown', function(e) {
+                e.preventDefault();
+                insertMention(mentionTarget, u.display_name);
+            });
+            mentionDropdown.appendChild(item);
+        });
+        positionDropdown(input);
+        mentionDropdown.style.display = 'block';
+    }
+
+    var mentionTimer = null;
+    function onMentionInput(e) {
+        var input = e.target;
+        var val   = input.value;
+        var cur   = input.selectionStart;
+        var i = cur - 1;
+        while (i >= 0 && /[\w\-]/.test(val[i])) i--;
+        if (i >= 0 && val[i] === '@') {
+            mentionStart  = i;
+            mentionTarget = input;
+            var query = val.slice(i + 1, cur);
+            if (query.length === 0) { hideMentionDropdown(); return; }
+            clearTimeout(mentionTimer);
+            mentionTimer = setTimeout(function() {
+                fetch('index.php?action=search_users&q=' + encodeURIComponent(query))
+                .then(function(r){ return r.json(); })
+                .then(function(d){ showMentionResults(d.users || [], input); });
+            }, 120);
+        } else {
+            hideMentionDropdown();
+        }
+    }
+
+    function onMentionKeydown(e) {
+        if (!mentionDropdown || mentionDropdown.style.display === 'none') return;
+        var items = mentionDropdown.querySelectorAll('div');
+        if (!items.length) return;
+        var active = mentionDropdown.querySelector('div.dd-active');
+        var idx = active ? Array.from(items).indexOf(active) : -1;
+        if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            if (active) active.classList.remove('dd-active');
+            var next = items[Math.min(idx + 1, items.length - 1)];
+            next.classList.add('dd-active');
+            next.style.background = 'var(--forum-hover)';
+        } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            if (active) active.classList.remove('dd-active');
+            var prev = items[Math.max(idx - 1, 0)];
+            prev.classList.add('dd-active');
+            prev.style.background = 'var(--forum-hover)';
+        } else if (e.key === 'Enter' || e.key === 'Tab') {
+            var chosen = mentionDropdown.querySelector('div.dd-active') || items[0];
+            if (chosen && mentionTarget) {
+                e.preventDefault();
+                var nameEl = chosen.querySelector('span');
+                var rawName = nameEl ? nameEl.textContent.replace(/^@/, '') : '';
+                if (rawName) insertMention(mentionTarget, rawName);
+            }
+        } else if (e.key === 'Escape') {
+            hideMentionDropdown();
+        }
+    }
+
+    document.addEventListener('click', function(e) {
+        if (mentionDropdown && !mentionDropdown.contains(e.target)) hideMentionDropdown();
+    });
+
+    function attachMentionListeners(input) {
+        if (input.dataset.mentionBound) return;
+        input.dataset.mentionBound = '1';
+        input.addEventListener('input',   onMentionInput);
+        input.addEventListener('keydown', onMentionKeydown);
+    }
+
+    document.querySelectorAll('textarea[name="content"], input[name="comment_content"]').forEach(attachMentionListeners);
+
+    var observer = new MutationObserver(function(mutations) {
+        mutations.forEach(function(m) {
+            m.addedNodes.forEach(function(node) {
+                if (node.nodeType !== 1) return;
+                node.querySelectorAll && node.querySelectorAll('input[name="comment_content"], textarea[name="content"]').forEach(attachMentionListeners);
+                if ((node.tagName === 'INPUT' && node.name === 'comment_content') ||
+                    (node.tagName === 'TEXTAREA' && node.name === 'content')) {
+                    attachMentionListeners(node);
+                }
+            });
+        });
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    // --- end @mention autocomplete ---
 
     // AJAX Voting
     document.addEventListener('click', function(e) {
@@ -1969,7 +2253,7 @@ function toggleMoreForums(btn) {
             input.value = '';
 
             var commentHtml =
-                '<p class="text-sm whitespace-pre-wrap" style="color:var(--text-primary)">' + escHtml(c.content) + '</p>' +
+                '<p class="text-sm whitespace-pre-wrap" style="color:var(--text-primary)">' + contentHtml(c.content) + '</p>' +
                 '<p class="text-xs mt-1" style="color:var(--text-muted)">' + authorHtml(c.user_id, c.author) + ' &middot; just now</p>';
 
             if (parId !== '') {
@@ -2084,7 +2368,7 @@ function toggleMoreForums(btn) {
                 '</div>' +
                 '<div class="flex-1 p-5">' +
                 '<div class="flex items-start justify-between gap-2">' +
-                '<p class="flex-1 whitespace-pre-wrap" style="color:var(--text-primary)">' + escHtml(post.content) + '</p>' +
+                '<p class="flex-1 whitespace-pre-wrap" style="color:var(--text-primary)">' + contentHtml(post.content) + '</p>' +
                 deleteBtn +
                 '</div>' +
                 imgHtml +
@@ -2137,6 +2421,135 @@ function toggleMoreForums(btn) {
                 submitBtn.disabled = false;
                 submitBtn.textContent = 'Post';
             });
+        });
+    }
+
+    // Post search
+    var searchInput   = document.getElementById('post-search-input');
+    var searchGlobal  = document.getElementById('post-search-global');
+    var searchClear   = document.getElementById('post-search-clear');
+    var searchStatus  = document.getElementById('post-search-status');
+    var searchTimer   = null;
+    var searchActive  = false;
+    var originalPosts = null;
+
+    function highlightTerms(html, q) {
+        if (!q) return html;
+        var safe = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        return html.replace(
+            new RegExp('(' + safe + ')(?=[^<]*(?:<|$))', 'gi'),
+            '<mark style="background:rgba(0,128,128,.25);border-radius:2px;padding:0 1px">$1</mark>'
+        );
+    }
+
+    function buildSearchCard(post) {
+        var pid = parseInt(post.id, 10);
+        var imgHtml = post.has_image == 1
+            ? '<img src="index.php?img=post&id=' + pid + '" alt="" class="post-image">'
+            : '';
+        var forumBadge = post.forum_name
+            ? '<a href="index.php?forum=' + escHtml(post.forum_name) + '" class="underline" style="color:var(--teal-mid)">k/' + escHtml(post.forum_name) + '</a> · '
+            : '';
+        var authorLink = post.user_id
+            ? '<a href="index.php?page=profile&uid=' + escHtml(post.user_id) + '" class="font-medium hover:underline" style="color:var(--text-author)">' + escHtml(post.author) + '</a>'
+            : '<span class="font-medium" style="color:var(--text-author)">' + escHtml(post.author) + '</span>';
+
+        var rawContent = post.content || '';
+        var q = searchInput ? searchInput.value.trim() : '';
+        var renderedContent = highlightTerms(contentHtml(rawContent), escHtml(q));
+
+        return '<div id="post' + pid + '" class="card shadow-sm rounded-xl flex flex-col md:flex-row overflow-hidden" style="animation:fadeIn .2s ease">' +
+            '<div id="vs' + pid + '" class="flex md:flex-col flex-row items-center justify-center p-3 gap-2 md:gap-1 min-w-[3.5rem]" style="background-color:var(--vote-strip-bg)">' +
+            '<a data-vote="up" data-pid="' + pid + '" href="#" class="flex items-center justify-center w-9 h-9 rounded-lg vote-btn vote-btn-up">' +
+            '<svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 15l7-7 7 7"/></svg></a>' +
+            '<span class="vote-count font-bold text-sm text-center min-w-[1.5rem]" style="color:var(--teal-mid)">' + escHtml(String(post.votes || 0)) + '</span>' +
+            '<a data-vote="down" data-pid="' + pid + '" href="#" class="flex items-center justify-center w-9 h-9 rounded-lg vote-btn vote-btn-down">' +
+            '<svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M19 9l-7 7-7-7"/></svg></a>' +
+            '</div>' +
+            '<div class="flex-1 p-5">' +
+            '<p class="whitespace-pre-wrap" style="color:var(--text-primary)">' + renderedContent + '</p>' +
+            imgHtml +
+            '<p class="text-xs mt-2" style="color:var(--text-muted)">' + forumBadge + 'by ' + authorLink +
+            ' · <time class="utc-time" data-utc="' + escHtml(post.created_at || '') + '">' + escHtml((post.created_at || '').slice(0, 16)) + '</time>' +
+            ' · ' + escHtml(String(post.votes || 0)) + ' votes</p>' +
+            '</div></div>';
+    }
+
+    function runSearch(q) {
+        if (!postsList) return;
+        q = q.trim();
+        if (q === '') { clearSearch(); return; }
+
+        var isGlobal = searchGlobal && searchGlobal.checked;
+        var url = 'index.php?action=search_posts&q=' + encodeURIComponent(q) + '&limit=30';
+        if (!isGlobal) url += '&forum=' + encodeURIComponent(forum);
+
+        if (searchStatus) { searchStatus.textContent = 'Searching…'; searchStatus.classList.remove('hidden'); }
+
+        fetch(url)
+        .then(function(r){ return r.json(); })
+        .then(function(d) {
+            if (!searchActive) {
+                // save originals on first search
+                originalPosts = postsList.innerHTML;
+                searchActive = true;
+            }
+            if (searchClear) searchClear.classList.remove('hidden');
+
+            postsList.innerHTML = '';
+            if (!d.posts || !d.posts.length) {
+                postsList.innerHTML = '<div class="card shadow-sm rounded-xl p-8 text-center italic" style="color:var(--text-muted)">No posts found for "' + escHtml(q) + '".</div>';
+                if (searchStatus) { searchStatus.textContent = '0 results'; searchStatus.classList.remove('hidden'); }
+                return;
+            }
+            var tmp = document.createElement('div');
+            tmp.innerHTML = d.posts.map(buildSearchCard).join('');
+            while (tmp.firstChild) postsList.appendChild(tmp.firstChild);
+            if (window.localiseUtcTimes) window.localiseUtcTimes();
+
+            var scope = (isGlobal ? 'all forums' : 'k/' + forum);
+            var total = d.total != null ? d.total : d.posts.length;
+            if (searchStatus) {
+                searchStatus.textContent = total + ' result' + (total === 1 ? '' : 's') + ' in ' + scope;
+                searchStatus.classList.remove('hidden');
+            }
+        })
+        .catch(function() {
+            if (searchStatus) { searchStatus.textContent = 'Search failed. Try again.'; searchStatus.classList.remove('hidden'); }
+        });
+    }
+
+    function clearSearch() {
+        searchActive = false;
+        if (searchInput)  searchInput.value = '';
+        if (searchClear)  searchClear.classList.add('hidden');
+        if (searchStatus) searchStatus.classList.add('hidden');
+        if (postsList && originalPosts !== null) {
+            postsList.innerHTML = originalPosts;
+            originalPosts = null;
+            if (window.localiseUtcTimes) window.localiseUtcTimes();
+        }
+    }
+
+    if (searchInput) {
+        searchInput.addEventListener('input', function() {
+            clearTimeout(searchTimer);
+            var q = this.value.trim();
+            if (q === '') { clearSearch(); return; }
+            searchTimer = setTimeout(function(){ runSearch(q); }, 280);
+        });
+        searchInput.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') clearSearch();
+            if (e.key === 'Enter') { clearTimeout(searchTimer); runSearch(this.value); }
+        });
+    }
+    if (searchClear) {
+        searchClear.addEventListener('click', clearSearch);
+    }
+    if (searchGlobal) {
+        searchGlobal.addEventListener('change', function() {
+            var q = searchInput ? searchInput.value.trim() : '';
+            if (q) runSearch(q);
         });
     }
 })();
