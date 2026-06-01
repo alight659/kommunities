@@ -3,6 +3,13 @@ error_reporting(E_ERROR | E_PARSE);
 session_start();
 
 
+// Security headers sent on every response
+header("X-Frame-Options: DENY");
+header("Referrer-Policy: same-origin");
+header("X-Content-Type-Options: nosniff");
+// CSP: allow inline styles, same-origin scripts, data: for images
+header("Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'");
+
 // sqlite
 $db = new PDO("sqlite:" . __DIR__ . "/db.sqlite");
 $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
@@ -138,23 +145,27 @@ function get_comments(PDO $db, int $post_id, ?int $parent_id = null): array {
     return $s->fetchAll(PDO::FETCH_ASSOC);
 }
 function render_mentions(PDO $db, string $text): string {
-    return preg_replace_callback(
-        '/@([\w\-]{1,30})/',
-        function (array $m) use ($db): string {
-            $name = $m[1];
-            $s = $db->prepare("SELECT id FROM users WHERE display_name=:n LIMIT 1");
-            $s->execute([':n' => $name]);
-            $uid = $s->fetchColumn();
-            $safe = htmlspecialchars('@' . $name);
-            if ($uid) {
-                return '<a href="index.php?page=profile&uid=' . (int)$uid . '" '
-                     . 'class="mention-link font-semibold" '
-                     . 'style="color:var(--teal-mid)">' . $safe . '</a>';
-            }
-            return $safe;
-        },
-        htmlspecialchars($text)
-    );
+    $escaped = htmlspecialchars($text);
+    if (!preg_match_all('/@([\w\-]{1,30})/', $escaped, $all)) return $escaped;
+    $names = array_unique($all[1]);
+    if (!$names) return $escaped;
+    $placeholders = implode(',', array_fill(0, count($names), '?'));
+    $s = $db->prepare("SELECT id, display_name FROM users WHERE display_name IN ($placeholders)");
+    $s->execute($names);
+    $map = [];
+    foreach ($s->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $map[$row['display_name']] = (int)$row['id'];
+    }
+    return preg_replace_callback('/@([\w\-]{1,30})/', function (array $m) use ($map): string {
+        $name = $m[1];
+        $safe = '@' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8');
+        if (isset($map[$name])) {
+            return '<a href="index.php?page=profile&amp;uid=' . $map[$name] . '" '
+                 . 'class="mention-link font-semibold" '
+                 . 'style="color:var(--teal-mid)">' . $safe . '</a>';
+        }
+        return $safe;
+    }, $escaped);
 }
 
 function forum_name_valid(string $name): bool {
@@ -258,7 +269,7 @@ if (!$authHeader && function_exists('apache_request_headers')) {
     }
 }
 if (preg_match('/^Bearer\s+(.+)$/i', $authHeader, $m)) $bearerToken = trim($m[1]);
-if (!$bearerToken && isset($_GET['token'])) $bearerToken = trim($_GET['token']);
+// Note: token in GET param is intentionally not supported - it leaks into server logs and Referer headers.
 if ($bearerToken) { $currentUser = user_by_token($db, $bearerToken); if ($currentUser) touch_user($db, $currentUser['token']); }
 if (!$currentUser && !empty($_SESSION['user_token'])) {
     $currentUser = user_by_token($db, $_SESSION['user_token']);
@@ -267,24 +278,29 @@ if (!$currentUser && !empty($_SESSION['user_token'])) {
 if (!$currentUser && !empty($_COOKIE['user_token'])) {
     $currentUser = user_by_token($db, $_COOKIE['user_token']);
     if ($currentUser) { $_SESSION['user_token'] = $currentUser['token']; touch_user($db, $currentUser['token']); }
-    else setcookie('user_token', '', time() - 1, '/', '', false, true);
+    else setcookie('user_token', '', ['expires'=>time()-1,'path'=>'/','httponly'=>true,'samesite'=>'Strict']);
 }
 $displayName = $currentUser['display_name'] ?? '';
 if (!isset($_SESSION['dm_authorized'])) $_SESSION['dm_authorized'] = [];
 
 
 //  Image Serving
+define('ALLOWED_IMG_MIMES', ['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
 if (isset($_GET['img'])) {
     $type = $_GET['img']; $id = (int)($_GET['id'] ?? 0);
     if ($type === 'post' && $id) {
         $r = $db->prepare("SELECT image_data,image_mime FROM posts WHERE id=:id AND image_data IS NOT NULL");
         $r->execute([':id' => $id]); $row = $r->fetch(PDO::FETCH_ASSOC);
-        if ($row) { header('Content-Type: '.$row['image_mime']); header('Cache-Control: public,max-age=86400'); header('X-Content-Type-Options: nosniff'); echo $row['image_data']; exit; }
+        if ($row && in_array($row['image_mime'], ALLOWED_IMG_MIMES, true)) {
+            header('Content-Type: '.$row['image_mime']); header('Cache-Control: public,max-age=86400'); header('X-Content-Type-Options: nosniff'); echo $row['image_data']; exit;
+        }
     }
     if ($type === 'avatar' && $id) {
         $r = $db->prepare("SELECT avatar_data,avatar_mime FROM users WHERE id=:id AND avatar_data IS NOT NULL");
         $r->execute([':id' => $id]); $row = $r->fetch(PDO::FETCH_ASSOC);
-        if ($row) { header('Content-Type: '.$row['avatar_mime']); header('Cache-Control: public,max-age=86400'); header('X-Content-Type-Options: nosniff'); echo $row['avatar_data']; exit; }
+        if ($row && in_array($row['avatar_mime'], ALLOWED_IMG_MIMES, true)) {
+            header('Content-Type: '.$row['avatar_mime']); header('Cache-Control: public,max-age=86400'); header('X-Content-Type-Options: nosniff'); echo $row['avatar_data']; exit;
+        }
     }
     http_response_code(404); exit;
 }
@@ -322,6 +338,17 @@ if ($isApi) {
     $input  = api_input();
 
     if ($action === 'generate_token') {
+        // Simple rate limit: max 3 new accounts per IP per hour
+        $ip     = $_SERVER['REMOTE_ADDR'] ?? '';
+        $window = date('Y-m-d H:0', time());
+        $rlKey  = 'rl_gentok_' . md5($ip . $window);
+        $count  = (int)($_SESSION[$rlKey] ?? 0);
+        if ($count >= 3) {
+            http_response_code(429);
+            echo json_encode(['error' => 'Too many accounts created. Try again later.']);
+            exit;
+        }
+        $_SESSION[$rlKey] = $count + 1;
         $user = create_user($db);
         echo json_encode([
             'ok'           => true,
@@ -333,7 +360,7 @@ if ($isApi) {
     }
 
     if ($action === 'login') {
-        $t = strtoupper(trim(api_field($input, 'token', $_GET['token'] ?? '')));
+        $t = strtoupper(trim(api_field($input, 'token')));
         if (!$t) { http_response_code(400); echo json_encode(['error' => 'token required']); exit; }
         $user = user_by_token($db, $t);
         if (!$user) { http_response_code(401); echo json_encode(['error' => 'Invalid token']); exit; }
@@ -694,15 +721,16 @@ if ($isApi) {
 
         case 'search_users':
             $q = trim($_GET['q'] ?? '');
-            if ($q === '' || strlen($q) < 1) {
+            if ($q === '') {
                 echo json_encode(['users' => []]); break;
             }
+            $likeQ = str_replace(['%','_'], ['\\%','\\_'], $q) . '%';
             $su = $db->prepare(
                 "SELECT id, display_name FROM users
-                 WHERE display_name LIKE :q
+                 WHERE display_name LIKE :q ESCAPE '\\'
                  ORDER BY display_name ASC LIMIT 10"
             );
-            $su->execute([':q' => $q . '%']);
+            $su->execute([':q' => $likeQ]);
             $matches = $su->fetchAll(PDO::FETCH_ASSOC);
             echo json_encode(['users' => $matches]);
             break;
@@ -767,10 +795,18 @@ if ($isApi) {
             if (!$withId || $withId === (int)$currentUser['id']) {
                 http_response_code(400); echo json_encode(['error' => 'Invalid with_id']); break;
             }
+            $dmAuth = $db->prepare(
+                "SELECT 1 FROM direct_messages
+                 WHERE (from_id=:a AND to_id=:b) OR (from_id=:c AND to_id=:d) LIMIT 1"
+            );
+            $dmAuth->execute([':a'=>(int)$currentUser['id'],':b'=>$withId,':c'=>$withId,':d'=>(int)$currentUser['id']]);
+            if (!$dmAuth->fetchColumn()) {
+                http_response_code(403); echo json_encode(['error' => 'Forbidden']); break;
+            }
             $db->prepare("UPDATE direct_messages SET read_at=CURRENT_TIMESTAMP WHERE from_id=:f AND to_id=:t AND read_at IS NULL")
                ->execute([':f'=>$withId,':t'=>(int)$currentUser['id']]);
-            $cs = $db->prepare("SELECT dm.*,u.display_name AS from_name FROM direct_messages dm JOIN users u ON dm.from_id=u.id WHERE ((dm.from_id=:a AND dm.to_id=:b) OR (dm.from_id=:b2 AND dm.to_id=:a2)) AND dm.id > :after ORDER BY dm.created_at ASC");
-            $cs->execute([':a'=>(int)$currentUser['id'], ':b'=>$withId, ':b2'=>$withId, ':a2'=>(int)$currentUser['id'], ':after'=>$afterId]);
+            $cs = $db->prepare("SELECT dm.*,u.display_name AS from_name FROM direct_messages dm JOIN users u ON dm.from_id=u.id WHERE ((dm.from_id=:a AND dm.to_id=:b) OR (dm.from_id=:c AND dm.to_id=:d)) AND dm.id > :after ORDER BY dm.created_at ASC");
+            $cs->execute([':a'=>(int)$currentUser['id'], ':b'=>$withId, ':c'=>$withId, ':d'=>(int)$currentUser['id'], ':after'=>$afterId]);
             $messages = $cs->fetchAll(PDO::FETCH_ASSOC);
             $uc = $db->prepare("SELECT COUNT(*) FROM direct_messages WHERE to_id=:id AND read_at IS NULL");
             $uc->execute([':id'=>(int)$currentUser['id']]);
@@ -794,16 +830,26 @@ if ($isApi) {
 }
 
 
+// Safe self URL for redirects
+$selfUrl = '/' . ltrim(parse_url($_SERVER['PHP_SELF'], PHP_URL_PATH) ?? 'index.php', '/');
+
 //  Form Handler
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     // Token gate
     if (isset($_POST['action'])) {
         if ($_POST['action'] === 'generate_token') {
-            $user = create_user($db);
-            $_SESSION['user_token'] = $user['token']; rotate_csrf(); $_SESSION['new_token_show'] = $user['token'];
-            setcookie('user_token', $user['token'], time()+60*60*24*365, '/', '', false, true);
-            header("Location: ".$_SERVER['PHP_SELF']."?forum=".urlencode($_GET['forum']??'general')); exit;
+            $ip     = $_SERVER['REMOTE_ADDR'] ?? '';
+            $window = date('Y-m-d H:0', time());
+            $rlKey  = 'rl_gentok_' . md5($ip . $window);
+            $count  = (int)($_SESSION[$rlKey] ?? 0);
+            if ($count < 5) {
+                $_SESSION[$rlKey] = $count + 1;
+                $user = create_user($db);
+                $_SESSION['user_token'] = $user['token']; rotate_csrf(); $_SESSION['new_token_show'] = $user['token'];
+                setcookie('user_token', $user['token'], ['expires'=>time()+60*60*24*365,'path'=>'/','httponly'=>true,'samesite'=>'Strict']);
+            }
+            header("Location: ".$selfUrl."?forum=".urlencode($_GET['forum']??'general')); exit;
         }
         if ($_POST['action'] === 'login_token') {
             $t = strtoupper(preg_replace('/[^A-F0-9\-]/','',trim($_POST['token']??'')));
@@ -812,16 +858,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 session_regenerate_id(true);
                 $_SESSION['user_token'] = $user['token'];
                 rotate_csrf();
-                setcookie('user_token', $user['token'], time()+60*60*24*365, '/', '', false, true);
+                setcookie('user_token', $user['token'], ['expires'=>time()+60*60*24*365,'path'=>'/','httponly'=>true,'samesite'=>'Strict']);
                 touch_user($db, $user['token']);
-                header("Location: ".$_SERVER['PHP_SELF']."?forum=".urlencode($_GET['forum']??'general')); exit;
+                header("Location: ".$selfUrl."?forum=".urlencode($_GET['forum']??'general')); exit;
             } else { $authError = "Token not found. Please check and try again."; }
         }
         if ($_POST['action'] === 'logout') {
             unset($_SESSION['user_token']);
             rotate_csrf();
-            setcookie('user_token', '', time()-1, '/', '', false, true);
-            header("Location: ".$_SERVER['PHP_SELF']."?forum=".urlencode($_GET['forum']??'general')); exit;
+            setcookie('user_token', '', ['expires'=>time()-1,'path'=>'/','httponly'=>true,'samesite'=>'Strict']);
+            header("Location: ".$selfUrl."?forum=".urlencode($_GET['forum']??'general')); exit;
         }
     }
 
@@ -837,7 +883,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $db->prepare("UPDATE posts SET author=:n WHERE user_id=:uid")->execute([':n'=>$n,':uid'=>(int)$currentUser['id']]);
                 $db->prepare("UPDATE comments SET author=:n WHERE user_id=:uid")->execute([':n'=>$n,':uid'=>(int)$currentUser['id']]);
             }
-            $r = (isset($_GET['page'])&&$_GET['page']==='profile') ? $_SERVER['PHP_SELF'].'?page=profile' : $_SERVER['PHP_SELF'].'?forum='.urlencode($forum);
+            $r = (isset($_GET['page'])&&$_GET['page']==='profile') ? $selfUrl.'?page=profile' : $selfUrl.'?forum='.urlencode($forum);
             header("Location: $r"); exit;
         }
 
@@ -845,7 +891,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (isset($_POST['set_bio'])) {
             $bio = substr(trim($_POST['set_bio']??''),0,300);
             $db->prepare("UPDATE users SET bio=:b WHERE token=:t")->execute([':b'=>$bio,':t'=>$currentUser['token']]);
-            header("Location: ".$_SERVER['PHP_SELF']."?page=profile"); exit;
+            header("Location: ".$selfUrl."?page=profile"); exit;
         }
 
         // Upload avatar
@@ -855,7 +901,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $db->prepare("UPDATE users SET avatar_data=:d,avatar_mime=:m WHERE token=:t")
                    ->execute([':d'=>$img['data'],':m'=>$img['mime'],':t'=>$currentUser['token']]);
             } catch (RuntimeException $e) { $_SESSION['profile_error'] = $e->getMessage(); }
-            header("Location: ".$_SERVER['PHP_SELF']."?page=profile"); exit;
+            header("Location: ".$selfUrl."?page=profile"); exit;
         }
 
         // Delete account
@@ -870,8 +916,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $db->prepare("DELETE FROM posts WHERE user_id=:uid")->execute([':uid'=>$uid]);
             $db->prepare("DELETE FROM comments WHERE user_id=:uid")->execute([':uid'=>$uid]);
             $db->prepare("DELETE FROM users WHERE id=:uid")->execute([':uid'=>$uid]);
-            unset($_SESSION['user_token']); setcookie('user_token', '', time()-1, '/', '', false, true);
-            header("Location: ".$_SERVER['PHP_SELF']); exit;
+            unset($_SESSION['user_token']); setcookie('user_token', '', ['expires'=>time()-1,'path'=>'/','httponly'=>true,'samesite'=>'Strict']);
+            header("Location: ".$selfUrl); exit;
         }
 
         // Create forum
@@ -969,10 +1015,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $par=isset($_POST['parent_id'])&&$_POST['parent_id']!==''?(int)$_POST['parent_id']:null;
             $isAjax = !empty($_POST['ajax']);
             $newCid = null;
-            if ($ct!==''&&strlen($ct)<=5000) {
-                $db->prepare("INSERT INTO comments (post_id,parent_id,author,user_id,content) VALUES (:pid,:par,:a,:uid,:c)")
-                   ->execute([':pid'=>$pid,':par'=>$par,':a'=>$displayName,':uid'=>(int)$currentUser['id'],':c'=>$ct]);
-                $newCid = (int)$db->lastInsertId();
+            if ($ct!==''&&strlen($ct)<=5000&&$pid) {
+                $pex = $db->prepare("SELECT id FROM posts WHERE id=:id");
+                $pex->execute([':id'=>$pid]);
+                if ($pex->fetchColumn()) {
+                    if ($par !== null) {
+                        $parEx = $db->prepare("SELECT id FROM comments WHERE id=:id AND post_id=:pid");
+                        $parEx->execute([':id'=>$par,':pid'=>$pid]);
+                        if (!$parEx->fetchColumn()) $par = null; // silently drop invalid parent
+                    }
+                    $db->prepare("INSERT INTO comments (post_id,parent_id,author,user_id,content) VALUES (:pid,:par,:a,:uid,:c)")
+                       ->execute([':pid'=>$pid,':par'=>$par,':a'=>$displayName,':uid'=>(int)$currentUser['id'],':c'=>$ct]);
+                    $newCid = (int)$db->lastInsertId();
+                }
             }
             if ($isAjax) {
                 header('Content-Type: application/json');
@@ -1092,8 +1147,8 @@ if ($page === 'messages' && $currentUser) {
         $wu = $db->prepare("SELECT id,display_name,avatar_data FROM users WHERE id=:id");
         $wu->execute([':id'=>$withId]); $dmWithUser = $wu->fetch(PDO::FETCH_ASSOC) ?: null;
         if ($dmWithUser) {
-            $hasExisting = $db->prepare("SELECT 1 FROM direct_messages WHERE (from_id=:a AND to_id=:b) OR (from_id=:b AND to_id=:a) LIMIT 1");
-            $hasExisting->execute([':a'=>$myId, ':b'=>$withId]);
+            $hasExisting = $db->prepare("SELECT 1 FROM direct_messages WHERE (from_id=:a AND to_id=:b) OR (from_id=:c AND to_id=:d) LIMIT 1");
+            $hasExisting->execute([':a'=>$myId, ':b'=>$withId, ':c'=>$withId, ':d'=>$myId]);
             $hasExistingOk = (bool)$hasExisting->fetchColumn();
             $dmDenied = !$hasExistingOk && empty($_SESSION['dm_authorized'][$withId]);
             if (!$dmDenied) {
